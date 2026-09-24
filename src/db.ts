@@ -25,15 +25,7 @@ export function saveEkoraProducts(products: any[]) {
   fs.writeFileSync(PRODUCTS_JSON_PATH, JSON.stringify(products, null, 2), 'utf8');
 }
 
-export async function setEkoraProductStock(productId: string, inStock: boolean) {
-  const products = getEkoraProducts();
-  const product = products.find((p: any) => String(p.id) === String(productId));
-  if (product) {
-    product.inStock = inStock;
-    product.isQuoteOnly = !inStock;
-    saveEkoraProducts(products);
-  }
-
+export async function setEkoraProductStockInDB(productId: string, inStock: boolean) {
   if (dbPool) {
     const stockValue = inStock ? 500 : 0;
     try {

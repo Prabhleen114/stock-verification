@@ -1,6 +1,6 @@
 import { crawlJindeal } from './crawler';
 import { normalizeCore } from './matcher';
-import { getEkoraProducts, setEkoraProductStock, loadTrackerState, saveTrackerState } from './db';
+import { getEkoraProducts, setEkoraProductStockInDB, loadTrackerState, saveTrackerState, saveEkoraProducts } from './db';
 
 export async function runSync() {
   console.log('[Sync] Starting stock verification sync...');
@@ -16,8 +16,8 @@ export async function runSync() {
   // Create a map for quick lookup by normalized title
   const ekoraMap = new Map<string, any>();
   for (const prod of ekoraProducts) {
-    if (prod.title) {
-      ekoraMap.set(normalizeCore(prod.title), prod);
+    if (prod.name) {
+      ekoraMap.set(normalizeCore(prod.name), prod);
     }
   }
 
@@ -27,6 +27,7 @@ export async function runSync() {
 
   let newOosCount = 0;
   let restockedCount = 0;
+  let productsJsonDirty = false;
 
   // 4. Process Jindeal Products
   for (const jp of jindealProducts) {
@@ -42,10 +43,13 @@ export async function runSync() {
           trackerState[ekoraId] = {
             ekoraId,
             jindealId: jp.jindealId,
-            title: ekoraMatch.title,
+            title: ekoraMatch.name,
             outOfStockSince: new Date().toISOString()
           };
-          await setEkoraProductStock(ekoraId, false);
+          await setEkoraProductStockInDB(ekoraId, false);
+          ekoraMatch.inStock = false;
+          ekoraMatch.isQuoteOnly = true;
+          productsJsonDirty = true;
           newOosCount++;
         }
         currentTrackerKeys.delete(ekoraId); // mark as seen and still OOS
@@ -54,7 +58,10 @@ export async function runSync() {
         if (trackerState[ekoraId]) {
           // Was previously OOS, now back in stock!
           console.log(`[Sync] Found RESTOCKED: ${jp.jindealTitle} -> Ekora ID: ${ekoraId}`);
-          await setEkoraProductStock(ekoraId, true);
+          await setEkoraProductStockInDB(ekoraId, true);
+          ekoraMatch.inStock = true;
+          ekoraMatch.isQuoteOnly = false;
+          productsJsonDirty = true;
           delete trackerState[ekoraId];
           restockedCount++;
           currentTrackerKeys.delete(ekoraId);
@@ -63,7 +70,10 @@ export async function runSync() {
     }
   }
 
-  // 6. Save state
+  // 6. Save states
+  if (productsJsonDirty) {
+    saveEkoraProducts(ekoraProducts);
+  }
   saveTrackerState(trackerState);
 
   console.log(`[Sync] Sync complete. Newly OOS: ${newOosCount}, Restocked: ${restockedCount}, Total Currently OOS: ${Object.keys(trackerState).length}`);
