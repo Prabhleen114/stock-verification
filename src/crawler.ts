@@ -63,7 +63,7 @@ export async function crawlJindeal(maxPages = 50): Promise<ScrapedProduct[]> {
       }
       
       page++;
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 10000));
     } catch (error) {
       console.error(`[Crawler] Error fetching page ${page}:`, error);
       break;
