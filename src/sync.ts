@@ -1,5 +1,5 @@
 import { crawlJindeal } from './crawler';
-import { normalizeCore } from './matcher';
+import { normalizeCore, extractModelCode, getEkoraModelCode, findEkoraMatch } from './matcher';
 import { getEkoraProducts, setEkoraProductStockInDB, loadTrackerState, saveTrackerState, saveEkoraProducts } from './db';
 
 export async function runSync() {
@@ -13,11 +13,16 @@ export async function runSync() {
   const ekoraProducts = getEkoraProducts();
   console.log(`[Sync] Loaded ${ekoraProducts.length} products from Ekora Bazaar.`);
   
-  // Create a map for quick lookup by normalized title
-  const ekoraMap = new Map<string, any>();
+  // Create maps for lookup: by exact model code, and by normalized core title
+  const ekoraByModel = new Map<string, any>();
+  const ekoraByTitle = new Map<string, any>();
   for (const prod of ekoraProducts) {
+    const model = getEkoraModelCode(prod);
+    if (model) {
+      ekoraByModel.set(model, prod);
+    }
     if (prod.name) {
-      ekoraMap.set(normalizeCore(prod.name), prod);
+      ekoraByTitle.set(normalizeCore(prod.name), prod);
     }
   }
 
@@ -31,8 +36,7 @@ export async function runSync() {
 
   // 4. Process Jindeal Products
   for (const jp of jindealProducts) {
-    const normJindealTitle = normalizeCore(jp.jindealTitle);
-    const ekoraMatch = ekoraMap.get(normJindealTitle);
+    const ekoraMatch = findEkoraMatch(jp, ekoraByModel, ekoraByTitle);
 
     if (ekoraMatch) {
       const ekoraId = String(ekoraMatch.id);
@@ -46,11 +50,14 @@ export async function runSync() {
             title: ekoraMatch.name,
             outOfStockSince: new Date().toISOString()
           };
-          await setEkoraProductStockInDB(ekoraId, false);
+          newOosCount++;
+        }
+        // Always ensure both products.json and DB reflect out-of-stock status
+        if (ekoraMatch.inStock !== false || !ekoraMatch.isQuoteOnly) {
           ekoraMatch.inStock = false;
           ekoraMatch.isQuoteOnly = true;
           productsJsonDirty = true;
-          newOosCount++;
+          await setEkoraProductStockInDB(ekoraId, false);
         }
         currentTrackerKeys.delete(ekoraId); // mark as seen and still OOS
       } else {
@@ -70,7 +77,7 @@ export async function runSync() {
     }
   }
 
-  // 6. Save states
+  // 5. Save states
   if (productsJsonDirty) {
     saveEkoraProducts(ekoraProducts);
   }
