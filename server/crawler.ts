@@ -14,7 +14,20 @@ export function parsePrice(priceText: string): number {
   return 150;
 }
 
-// Live web crawler targeting Jindeal (WooCommerce shop)
+// Helper to construct paginated URLs across standard WooCommerce shops
+export function getPageUrl(baseUrl: string, page: number): string {
+  if (page === 1) return baseUrl;
+  try {
+    const parsed = new URL(baseUrl);
+    let pathname = parsed.pathname.replace(/\/page\/\d+\/?$/, '').replace(/\/$/, '');
+    parsed.pathname = `${pathname}/page/${page}/`;
+    return parsed.toString();
+  } catch {
+    return `${baseUrl.replace(/\/$/, '')}/page/${page}/`;
+  }
+}
+
+// Live web crawler targeting Jindeal (WooCommerce shop) or any custom shop URL
 export async function crawlLiveSupplier(
   baseUrl = 'https://jindeal.com/shop/',
   maxPages = 50
@@ -22,13 +35,14 @@ export async function crawlLiveSupplier(
   const products: ScrapedSupplierProduct[] = [];
   const logs: string[] = [];
   const seenSupplierIds = new Set<string>();
+  const seenUrls = new Set<string>();
 
   const startMsg = `[Crawler] Connecting to ${baseUrl} (Crawling all pages up to: ${maxPages})...`;
   logs.push(startMsg);
   console.log(startMsg);
 
   for (let page = 1; page <= maxPages; page++) {
-    const url = page === 1 ? baseUrl : `${baseUrl.replace(/\/$/, '')}/page/${page}/`;
+    const url = getPageUrl(baseUrl, page);
     let attempts = 0;
     const maxAttempts = 3;
     let pageSuccess = false;
@@ -65,9 +79,13 @@ export async function crawlLiveSupplier(
         const html = await response.text();
         const $ = cheerio.load(html);
 
-        const productElements = $('.product-small');
+        let productElements = $('.product-small');
         if (productElements.length === 0) {
-          const endMsg = `[Crawler] No .product-small items found on page ${page}. Ending crawl.`;
+          productElements = $('li.product, .type-product, .product');
+        }
+
+        if (productElements.length === 0) {
+          const endMsg = `[Crawler] No product items found on page ${page}. Ending crawl.`;
           logs.push(endMsg);
           console.log(endMsg);
           return { products, logs };
@@ -75,20 +93,22 @@ export async function crawlLiveSupplier(
 
         let pageExtracted = 0;
         productElements.each((_, el) => {
-          const classStr = $(el).attr('class') || '';
-          const idMatch = classStr.match(/post-(\d+)/);
+          // If element is an inner Flatsome box wrapper, skip to avoid double counting
+          if ($(el).hasClass('box') && $(el).parents('.product-small').length > 0) return;
 
-          // In Flatsome theme, only the outer card has post-(\d+)
-          if (!idMatch) return;
-          const supplierId = idMatch[1];
-          if (seenSupplierIds.has(supplierId)) return;
-          seenSupplierIds.add(supplierId);
-
-          const titleEl = $(el).find('.woocommerce-loop-product__title');
+          const titleEl = $(el).find('.woocommerce-loop-product__title, .product-title, .entry-title, h2, h3, .name').first();
           const rawTitle = titleEl.text().trim();
           if (!rawTitle) return;
 
           const productUrl = titleEl.find('a').attr('href') || $(el).find('a').attr('href') || '';
+          if (productUrl && seenUrls.has(productUrl)) return;
+          if (productUrl) seenUrls.add(productUrl);
+
+          const classStr = $(el).attr('class') || '';
+          const idMatch = classStr.match(/post-(\d+)/) || $(el).attr('id')?.match(/post-(\d+)/);
+          const supplierId = idMatch ? idMatch[1] : (productUrl || `item-${page}-${_}`);
+          if (seenSupplierIds.has(supplierId)) return;
+          seenSupplierIds.add(supplierId);
 
           // Out of stock detection (supports WooCommerce classes + label text)
           const isOutOfStock =

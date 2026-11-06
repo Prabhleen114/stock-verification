@@ -5,10 +5,12 @@
   "type": "module",
   "description": "Stock verification, crawler, matcher, and synchronization service for Ekora Bazaar",
   "scripts": {
-    "dev": "tsx server.ts",
-    "sync": "tsx server.ts --sync",
-    "build": "vite build",
     "start": "tsx server.ts",
+    "sync": "tsx server.ts",
+    "crawl": "tsx server.ts",
+    "dev": "tsx server.ts --web",
+    "web": "tsx server.ts --web",
+    "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

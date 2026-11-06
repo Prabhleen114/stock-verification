@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import readline from 'node:readline';
 import dotenv from 'dotenv';
 import { store } from './server/store.ts';
 import { crawlLiveSupplier, getSampleScrapedFeed } from './server/crawler.ts';
@@ -13,31 +14,84 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Direct CLI sync execution support (e.g. `npm run sync` or `tsx server.ts --sync`)
+// Helper for interactive command-line questions with automatic non-interactive fallback
+function askQuestion(query: string, defaultValue: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    console.log(`${query}${defaultValue} (auto-selected non-interactive)`);
+    return Promise.resolve(defaultValue);
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) => {
+    rl.question(query, (answer) => {
+      rl.close();
+      const trimmed = answer.trim();
+      resolve(trimmed || defaultValue);
+    });
+  });
+}
+
+// Interactive CLI Sync Runner
 async function runCliSync() {
-  const isSync = process.argv.includes('--sync') || process.argv.includes('--run-now');
-  if (!isSync) return false;
-
   console.log('===============================================================');
-  console.log('   EKORA BAZAAR - STOCK VERIFICATION & CATALOG INTAKE SYNC');
+  console.log('   EKORA BAZAAR - STOCK VERIFICATION & CATALOG INTAKE ENGINE   ');
   console.log('===============================================================');
 
-  const maxPagesArg = process.argv.find(a => a.startsWith('--pages='));
-  const maxPages = maxPagesArg ? parseInt(maxPagesArg.split('=')[1], 10) : 50;
+  // 1. Get website URL to crawl
+  const cliUrlArg = process.argv.find((a) => a.startsWith('--url='));
+  let targetUrl = cliUrlArg ? cliUrlArg.split('=')[1].trim() : '';
 
-  console.log(`[CLI Sync] Initiating crawl of https://jindeal.com/shop/ (up to ${maxPages} pages)...`);
-  const crawlResult = await crawlLiveSupplier('https://jindeal.com/shop/', maxPages);
+  if (!targetUrl) {
+    const defaultUrl = 'https://jindeal.com/shop/';
+    const inputUrl = await askQuestion(
+      `? Enter website URL to crawl [Default: ${defaultUrl}] (or type 'web' for Dashboard): `,
+      defaultUrl
+    );
 
-  console.log(`[CLI Sync] Scraped ${crawlResult.products.length} products from Jindeal.`);
+    if (inputUrl.toLowerCase() === 'web' || inputUrl.toLowerCase() === 'dashboard') {
+      await launchWebServer();
+      return;
+    }
+
+    targetUrl = inputUrl;
+  }
+
+  // 2. Get max pages to crawl
+  const cliPagesArg = process.argv.find((a) => a.startsWith('--pages='));
+  let maxPages = cliPagesArg ? parseInt(cliPagesArg.split('=')[1], 10) : 0;
+
+  if (!maxPages || isNaN(maxPages)) {
+    const defaultPages = 50;
+    const inputPages = await askQuestion(
+      `? Enter maximum pages to crawl [Default: ${defaultPages}]: `,
+      defaultPages.toString()
+    );
+    maxPages = parseInt(inputPages, 10) || defaultPages;
+  }
+
+  console.log('---------------------------------------------------------------');
+  console.log(`[Crawler] Target URL: ${targetUrl}`);
+  console.log(`[Crawler] Max Pages:  ${maxPages}`);
+  console.log(`[Crawler] Starting crawl, deduplication, O(1) matching, and live sync...`);
+  console.log('---------------------------------------------------------------');
+
+  const crawlResult = await crawlLiveSupplier(targetUrl, maxPages);
+
+  console.log(`[Crawler] Scraped ${crawlResult.products.length} products.`);
   for (const log of crawlResult.logs) {
     console.log(`  ${log}`);
   }
 
-  console.log(`[CLI Sync] Running matching, stock updates, AI intake, and catalog sync...`);
+  console.log(`[Sync] Running matching, stock updates, AI intake, and catalog sync...`);
   const { summary } = await store.processSyncBatch(crawlResult.products);
 
-  console.log('---------------------------------------------------------------');
+  console.log('===============================================================');
   console.log('SYNC EXECUTION SUMMARY:');
+  console.log(`  Target Website Crawled:          ${targetUrl}`);
   console.log(`  Total Supplier Products Crawled: ${summary.totalCrawled}`);
   console.log(`  Store Products Matched:          ${summary.matchedCount}`);
   console.log(`  Newly Marked Out of Stock:       ${summary.updatedOosCount}`);
@@ -46,12 +100,12 @@ async function runCliSync() {
   console.log(`  Total Active Store Catalog Size: ${summary.totalCatalogSize}`);
   console.log(`  Currently Out of Stock on Site:  ${summary.outOfStockCatalogCount}`);
   console.log('===============================================================');
+  console.log('Sync complete! Changes written to products.json & PostgreSQL.');
   process.exit(0);
 }
 
-async function startServer() {
-  if (await runCliSync()) return;
-
+// Web Server & API Launcher
+async function launchWebServer() {
   const app = express();
   app.use(express.json());
 
@@ -76,7 +130,6 @@ async function startServer() {
   // 3. Trigger Crawl & Sync Pipeline
   app.post('/api/sync/crawl', async (req: Request, res: Response) => {
     const { mode, url, maxPages } = req.body;
-    // mode: 'live' (hits jindeal.com) or 'sample' (instant sample feed)
     try {
       let scrapedItems = [];
       let crawlLogs: string[] = [];
@@ -88,9 +141,8 @@ async function startServer() {
         crawlLogs = crawlResult.logs;
         scrapedItems = crawlResult.products;
 
-        // If live crawl returned 0 items due to transient network block, fall back to sample feed with warning
         if (scrapedItems.length === 0) {
-          crawlLogs.push('[Crawler] Live network request returned 0 items; falling back to verified sample batch for synchronization.');
+          crawlLogs.push('[Crawler] Live network request returned 0 items; falling back to verified sample batch.');
           scrapedItems = getSampleScrapedFeed();
         }
       } else {
@@ -98,7 +150,6 @@ async function startServer() {
         crawlLogs.push(`[Crawler] Using curated sample batch of ${scrapedItems.length} real Jindeal products for instant verification.`);
       }
 
-      // Execute sync pipeline
       const { auditItems, summary } = await store.processSyncBatch(scrapedItems);
 
       res.json({
@@ -120,7 +171,7 @@ async function startServer() {
     res.json({ summary: store.getSummary(), logs: store.getAuditLogs() });
   });
 
-  // 5. Test AI Normalizer & Categorizer on any raw title
+  // 5. Test AI Normalizer & Categorizer
   app.post('/api/ai/test-normalize', async (req: Request, res: Response) => {
     const { rawTitle, rawPrice } = req.body;
     if (!rawTitle) {
@@ -179,11 +230,21 @@ async function startServer() {
 
   const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[StockSync Server] Listening on http://0.0.0.0:${PORT}`);
+    console.log(`[StockSync Server] Listening on http://localhost:${PORT}`);
   });
 }
 
-startServer().catch(err => {
-  console.error('[StockSync Server] Fatal error:', err);
+// Main execution switcher
+async function main() {
+  const isWebExplicit = process.argv.includes('--web') || process.argv.includes('-w');
+  if (isWebExplicit) {
+    await launchWebServer();
+  } else {
+    await runCliSync();
+  }
+}
+
+main().catch((err) => {
+  console.error('[StockSync] Fatal error:', err);
   process.exit(1);
 });
