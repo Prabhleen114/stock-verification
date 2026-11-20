@@ -29,7 +29,7 @@ export interface AICategorizationResult {
 export function fallbackNormalizeAndCategorize(rawTitle: string): AICategorizationResult {
   // 1. Remove brand names and model numbers
   let cleaned = cleanBrandPrefix(rawTitle);
-  cleaned = cleaned.replace(/\b(JKB|JK)[-\s]?\d+\b/gi, '').trim();
+  cleaned = cleaned.replace(/\b(JKB|JK|ARM|CFM|SSM|LBC|PM|NT|PGB|WCM|ART|CX|FO|FW|EO|TOL)[-\s]?\d+[a-zA-Z]?\b/gi, '').trim();
   cleaned = cleaned.replace(/\s+/g, ' ').replace(/^[-–—:|,\s]+|[-–—:|,\s]+$/g, '');
 
   // Capitalize properly

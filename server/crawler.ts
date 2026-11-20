@@ -14,11 +14,16 @@ export function parsePrice(priceText: string): number {
   return 150;
 }
 
-// Helper to construct paginated URLs across standard WooCommerce shops
+// Helper to construct paginated URLs across WooCommerce and Shopify shops
 export function getPageUrl(baseUrl: string, page: number): string {
   if (page === 1) return baseUrl;
   try {
     const parsed = new URL(baseUrl);
+    // If Shopify /collections/ or query parameter exists
+    if (parsed.pathname.includes('/collections/') || parsed.searchParams.has('page')) {
+      parsed.searchParams.set('page', String(page));
+      return parsed.toString();
+    }
     let pathname = parsed.pathname.replace(/\/page\/\d+\/?$/, '').replace(/\/$/, '');
     parsed.pathname = `${pathname}/page/${page}/`;
     return parsed.toString();
@@ -27,7 +32,157 @@ export function getPageUrl(baseUrl: string, page: number): string {
   }
 }
 
-// Live web crawler targeting Jindeal (WooCommerce shop) or any custom shop URL
+// Specialized Shopify multi-variant crawler (e.g. Matin Impex or any Shopify store)
+async function crawlShopifySupplier(
+  baseUrl: string,
+  maxPages: number,
+  logs: string[]
+): Promise<ScrapedSupplierProduct[]> {
+  const products: ScrapedSupplierProduct[] = [];
+  const seenSupplierIds = new Set<string>();
+
+  const urlObj = new URL(baseUrl);
+  const origin = urlObj.origin;
+  let collectionPath = urlObj.pathname.replace(/\/products\.json.*$/, '').replace(/\/$/, '');
+  if (!collectionPath.startsWith('/collections/')) {
+    collectionPath = '/collections/all';
+  }
+
+  const endpointBase = `${origin}${collectionPath}/products.json`;
+  const startMsg = `[Shopify Crawler] Connecting to ${endpointBase} with multi-variant extraction...`;
+  logs.push(startMsg);
+  console.log(startMsg);
+
+  for (let page = 1; page <= maxPages; page++) {
+    const pageUrl = `${endpointBase}?limit=250&page=${page}`;
+    let attempts = 0;
+    let pageSuccess = false;
+
+    while (attempts < 3 && !pageSuccess) {
+      attempts++;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+        const response = await fetch(pageUrl, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            Accept: 'application/json',
+          },
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            const endMsg = `[Shopify Crawler] Page ${page} returned 404 (Reached end of pagination).`;
+            logs.push(endMsg);
+            console.log(endMsg);
+            return products;
+          }
+          throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        if (!data.products || data.products.length === 0) {
+          const endMsg = `[Shopify Crawler] No more products found at page ${page}. Finished crawl.`;
+          logs.push(endMsg);
+          console.log(endMsg);
+          return products;
+        }
+
+        let pageExtracted = 0;
+        for (const p of data.products) {
+          const variants = p.variants || [];
+          const baseTitle = p.title.trim();
+          const handle = p.handle;
+          const defaultImg =
+            p.images?.[0]?.src ||
+            'https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?auto=format&fit=crop&w=600&q=80';
+
+          if (variants.length > 1) {
+            // Unpack every variant ("if an item has multiple variants dont forget to scrape them off")
+            for (const v of variants) {
+              const variantId = String(v.id);
+              if (seenSupplierIds.has(variantId)) continue;
+              seenSupplierIds.add(variantId);
+
+              const variantTitleSuffix =
+                v.title && v.title !== 'Default Title' ? ` - ${v.title.trim()}` : '';
+              const rawTitle = `${baseTitle}${variantTitleSuffix}`;
+              const cleanTitle = `${cleanBrandPrefix(baseTitle)}${variantTitleSuffix}`;
+              const modelCode = v.sku?.trim() || extractModelCode(rawTitle) || extractModelCode(baseTitle);
+              const rawPrice = parsePrice(String(v.price));
+              const isOutOfStock = v.available === false;
+              const productUrl = `${origin}/products/${handle}?variant=${v.id}`;
+              const imageUrl = v.featured_image?.src || defaultImg;
+
+              products.push({
+                supplierId: variantId,
+                rawTitle,
+                cleanTitle,
+                modelCode: modelCode || null,
+                rawPrice,
+                isOutOfStock,
+                productUrl,
+                imageUrl,
+                page,
+              });
+              pageExtracted++;
+            }
+          } else {
+            // Single variant or default title
+            const v = variants[0] || {};
+            const variantId = String(v.id || p.id);
+            if (seenSupplierIds.has(variantId)) continue;
+            seenSupplierIds.add(variantId);
+
+            const rawTitle = baseTitle;
+            const cleanTitle = cleanBrandPrefix(baseTitle);
+            const modelCode = v.sku?.trim() || extractModelCode(rawTitle);
+            const rawPrice = parsePrice(String(v.price));
+            const isOutOfStock = v.available === false;
+            const productUrl = `${origin}/products/${handle}`;
+            const imageUrl = v.featured_image?.src || defaultImg;
+
+            products.push({
+              supplierId: variantId,
+              rawTitle,
+              cleanTitle,
+              modelCode: modelCode || null,
+              rawPrice,
+              isOutOfStock,
+              productUrl,
+              imageUrl,
+              page,
+            });
+            pageExtracted++;
+          }
+        }
+
+        const progressMsg = `[Shopify Crawler] Page ${page}/${maxPages}: Scraped ${pageExtracted} variants (Total scraped: ${products.length})`;
+        logs.push(progressMsg);
+        console.log(progressMsg);
+        pageSuccess = true;
+
+        await new Promise((res) => setTimeout(res, 200));
+      } catch (err: any) {
+        console.warn(`[Shopify Crawler] Attempt ${attempts}/3 failed for page ${page}:`, err.message);
+        if (attempts >= 3) {
+          logs.push(`[Shopify Crawler] Skipping page ${page} after 3 failed attempts: ${err.message}`);
+          break;
+        }
+        await new Promise((res) => setTimeout(res, 1000 * attempts));
+      }
+    }
+  }
+
+  return products;
+}
+
+// Live web crawler targeting Jindeal (WooCommerce), Matin Impex (Shopify), or any custom shop URL
 export async function crawlLiveSupplier(
   baseUrl = 'https://jindeal.com/shop/',
   maxPages = 50
@@ -36,6 +191,21 @@ export async function crawlLiveSupplier(
   const logs: string[] = [];
   const seenSupplierIds = new Set<string>();
   const seenUrls = new Set<string>();
+
+  // 1. Detect if Shopify store (e.g. Matin Impex)
+  const isShopify = baseUrl.includes('/collections/') || baseUrl.includes('myshopify.com') || baseUrl.includes('matinimpex');
+  if (isShopify) {
+    try {
+      const shopifyProducts = await crawlShopifySupplier(baseUrl, maxPages, logs);
+      if (shopifyProducts.length > 0) {
+        return { products: shopifyProducts, logs };
+      }
+    } catch (err: any) {
+      const fallbackMsg = `[Crawler] Shopify endpoint notice: ${err.message}. Proceeding to HTML scraper.`;
+      logs.push(fallbackMsg);
+      console.warn(fallbackMsg);
+    }
+  }
 
   const startMsg = `[Crawler] Connecting to ${baseUrl} (Crawling all pages up to: ${maxPages})...`;
   logs.push(startMsg);

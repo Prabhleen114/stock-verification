@@ -1,23 +1,41 @@
 import { StoreProduct, ScrapedSupplierProduct } from './types.ts';
 
-// Clean out brand keywords like Vedini or Jindeal
+// Clean out brand keywords like Vedini, Jindeal, or Matin Impex
 export function cleanBrandPrefix(title: string): string {
   if (!title) return '';
   return title
-    .replace(/\b(VEDINI\s+INC|JINDEAL\s+INC|BY\s+JINDEAL|BY\s+VEDINI|VEDINI|JINDEAL)\b/gi, '')
+    .replace(/\b(MATIN\s+IMPEX|MATIN|VEDINI\s+INC|JINDEAL\s+INC|BY\s+JINDEAL|BY\s+VEDINI|VEDINI|JINDEAL)\b/gi, '')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^[-–—:|,\s]+|[-–—:|,\s]+$/g, '');
 }
 
-// Extract model codes such as JKB-3669, JKB3669, JK-12, etc. Standardized to alphanumeric (e.g. JKB3669)
+// Extract model codes such as JKB-3669, ARM537, CFM255, LBC001a, etc. Standardized to uppercase alphanumeric
 export function extractModelCode(str: string): string | null {
   if (!str) return null;
-  const match =
-    str.match(/\b(JKB|JK)[-\s]?(\d{1,6})\b/i) ||
-    str.match(/(?:mold|mould)[-\s]*(jkb|jk)[-\s]?(\d{1,6})/i) ||
-    str.match(/^(?:jkb|jk)[-_]?(\d{1,6})$/i);
-  return match ? `${match[1].toUpperCase()}${match[2]}` : null;
+  const trimmed = str.trim();
+
+  // 1. Direct SKU (e.g. ARM537, CFM255, LBC001a, JKB3669)
+  const directSkuMatch = trimmed.match(/^([A-Za-z]{2,6})[-_]?(\d{1,6}[a-zA-Z]?)$/);
+  if (directSkuMatch) {
+    return `${directSkuMatch[1].toUpperCase()}${directSkuMatch[2].toUpperCase()}`;
+  }
+
+  // 2. Look for model code inside title (e.g. JKB-3669, ARM537, CFM255, SSM257, LBC001a)
+  const titleMatch =
+    str.match(/\b(JKB|JK|ARM|CFM|SSM|LBC|PM|NT|PGB|WCM|ART|CX|FO|FW|EO|TOL)[-\s]?(\d{1,6}[a-zA-Z]?)\b/i) ||
+    str.match(/(?:mold|mould|model|code|sku)[-\s:]*([A-Za-z]{2,6})[-\s]?(\d{1,6}[a-zA-Z]?)/i) ||
+    str.match(/[\|\/]\s*([A-Za-z]{2,6})[-\s]?(\d{1,6}[a-zA-Z]?)\b/i) ||
+    str.match(/\b([A-Z]{2,4}\d{2,5}[a-zA-Z]?)\b/);
+
+  if (titleMatch) {
+    if (titleMatch[1] && titleMatch[2]) {
+      return `${titleMatch[1].toUpperCase()}${titleMatch[2].toUpperCase()}`;
+    }
+    return titleMatch[0].toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  return null;
 }
 
 // Extract model code from Ekora product (checks modelCode, tags, and title)

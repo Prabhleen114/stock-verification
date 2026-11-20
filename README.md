@@ -1,270 +1,229 @@
-# Ekora Bazaar - Stock Verification, Multi-Page Crawler & Catalog Intake Engine
+# Ekora Bazaar - Enterprise Crawl Vault, Stock Verification & Catalog Intake Engine
 
-An automated, high-performance synchronization and stock verification service for [Ekora Bazaar](https://github.com/Prabhleen114/ekorabazaar). It crawls supplier catalogs (such as Jindeal or any WooCommerce store), matches products against the live store inventory using an $O(1)$ indexed fuzzy matcher, automatically updates stock status (disabling customer checkout for Out of Stock items), and auto-ingests new uncataloged products with Gemini AI title cleaning and a standard 40% profit margin.
+An enterprise-grade, transactional synchronization and stock verification engine for [Ekora Bazaar](https://github.com/Prabhleen114/ekorabazaar). Built around an immutable staging vault so that a killed, interrupted, or buggy crawl **can never corrupt live storefront data or overwrite live catalog prices**.
+
+```
+Crawler (Shopify/WooCommerce)
+       │
+       ▼
+[ SupplierProduct Vault ] (Immutable Mirror: externalProductId + externalVariantId)
+       │
+       ▼
+[ In-Memory Diff Engine ] (contentHash != appliedHash)
+       │
+       ▼
+[ Circuit Breakers ] (Stock Flips <= 5%, Price Shifts <= 2%, Disappearance <= 10%, Yield >= 10)
+       │
+       ├─────────────────────────────────┐
+       ▼                                 ▼
+[ StagingChange ] (Pending Review)   [ Transactional Apply Engine ] (CAS on Product.version)
+                                         │
+                                         ├──> Product Table (PostgreSQL)
+                                         ├──> SyncAuditLog (Immutable change ledger)
+                                         └──> products.json (Atomic read-only .tmp export)
+```
 
 ---
 
 ## Table of Contents
 
+- [Core Architectural Principles](#core-architectural-principles)
+- [Pipeline Flowchart](#pipeline-flowchart)
 - [Features](#features)
-- [How It Works](#how-it-works)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [How to Work This Repo](#how-to-work-this-repo)
-  - [1. Interactive CLI Mode (Prompts for Website Link)](#1-interactive-cli-mode-prompts-for-website-link)
-  - [2. Non-Interactive CLI Flags](#2-non-interactive-cli-flags)
-  - [3. Web Management Dashboard (UI)](#3-web-management-dashboard-ui)
-  - [4. Automated Background Tasks (Windows)](#4-automated-background-tasks-windows)
-- [Architecture & File Structure](#architecture--file-structure)
-- [API Endpoints](#api-endpoints)
-- [Matching Algorithm & Performance](#matching-algorithm--performance)
+- [Circuit Breaker Guardrails](#circuit-breaker-guardrails)
+- [Field Ownership Matrix](#field-ownership-matrix)
+- [How to Work This Repo (CLI Guide)](#how-to-work-this-repo-cli-guide)
+  - [1. Dry Run / Diff Only](#1-dry-run--diff-only)
+  - [2. Safe Stock-Only Sync](#2-safe-stock-only-sync)
+  - [3. 1-Click Instant Rollback](#3-1-click-instant-rollback)
+  - [4. Web Management Dashboard](#4-web-management-dashboard)
+- [Directory Structure](#directory-structure)
+- [Database Schema (Vault Tables)](#database-schema-vault-tables)
+- [Safety Rules & Constraints](#safety-rules--constraints)
+
+---
+
+## Core Architectural Principles
+
+1. **The Crawler Never Writes to Live Tables**:
+   - The crawler only writes to `SupplierProduct` (an immutable mirror of external supplier feeds) and `CrawlRun` (the run ledger).
+   - Live `Product` rows and customer-facing storefront files are completely isolated from crawler code.
+2. **Shopify Multi-Variant Extraction**:
+   - Every product variant (Color, MOQ pack size, dimension) is unpacked into its own discrete record keyed by `(supplierKey, externalProductId, externalVariantId)`.
+   - Never matches on volatile handles or loose titles.
+3. **Immutable Content Hashing**:
+   - Compares current supplier hash (`contentHash`) against the last applied hash (`appliedHash`).
+   - If nothing changed at the supplier, zero database writes or diff calculations occur.
+4. **Compare-and-Swap (CAS) Version Control**:
+   - Live products maintain a monotonic `version` integer.
+   - During the apply phase, updates only proceed if `liveProduct.version === stagedChange.before.version`. If an admin modified the item in the meantime, the sync yields a non-destructive `CONFLICT` rather than overwriting manual edits.
+5. **Circuit Breakers (Automated Safety Halts)**:
+   - If abnormal stock flips, mass price deviations, or feed disappearances are detected, the pipeline automatically halts and refuses to apply changes to the live store.
+6. **1-Click Rollback**:
+   - Every applied change writes a before/after snapshot to `SyncAuditLog`.
+   - Running `--revert=RUN_ID` replays the audit log in reverse and restores both PostgreSQL and `products.json` to their exact pre-sync state.
+7. **Flat-File `products.json` Retired as Write Target**:
+   - PostgreSQL is the single source of truth.
+   - `src/lib/data/products.json` is generated read-only via atomic `.tmp` file swap at build time or after approved syncs.
+
+---
+
+## Pipeline Flowchart
+
+```mermaid
+flowchart TD
+    A["Supplier Feed (Shopify products.json)"] --> B["Vault Crawler (Heartbeat + Page Cursor)"]
+    B --> C["SupplierProduct Table (Immutable Mirror)"]
+    C --> D["In-Memory Diff Engine"]
+    
+    subgraph Guardrails ["Circuit Breaker Guardrails"]
+        D --> G1{"Mass Stock Flip <= 5%?"}
+        D --> G2{"Mass Price Shift <= 2%?"}
+        D --> G3{"Feed Disappearance <= 10%?"}
+        D --> G4{"Min Yield >= 10 items?"}
+    end
+
+    G1 -- Fail --> H["HALTED_GUARDRAIL (Catalog Untouched)"]
+    G2 -- Fail --> H
+    G3 -- Fail --> H
+    G4 -- Fail --> H
+
+    G1 -- Pass --> I["StagingChange Table (Status: PENDING)"]
+    G2 -- Pass --> I
+    G3 -- Pass --> I
+    G4 -- Pass --> I
+
+    I --> J{"Apply Mode"}
+    J -- STOCK_ONLY --> K["CAS Transactional Apply (Stock Availability Only)"]
+    J -- FULL / Approved --> L["CAS Transactional Apply (Stock + New Products)"]
+
+    K --> M["SyncAuditLog (Before / After Records)"]
+    L --> M
+    M --> N["Atomic Exporter (.tmp Swap)"]
+    N --> O["src/lib/data/products.json (Next.js Storefront)"]
+```
 
 ---
 
 ## Features
 
-- **Interactive URL Prompting**: When you run the application, it asks for the website link you want to crawl and how many pages to scrape (with instant defaults if you press Enter).
-- **50-Page WooCommerce & Generic Crawler**: Robust Cheerio scraper with automatic Flatsome theme deduplication (eliminating nested card duplicates) and polite 300ms pacing.
-- **$O(1)$ Hash-Indexed Catalog Matcher**:
-  - Resolves model code variations without hyphen ambiguity (e.g., `JKB-3669` matches `jkb3669`).
-  - Pre-indexes catalog by normalized model codes and core titles.
-  - Token overlap pre-filters (`tokenSetSimilarity < 0.6`) skip slow Levenshtein comparisons, matching 2,500+ items in milliseconds.
-- **Dynamic Out of Stock (OOS) UI Sync**:
-  - Automatically marks missing or "Out of Stock" supplier products in both PostgreSQL and `products.json`.
-  - Disables **Add to Cart** and **Buy Now** buttons on the Ekora Bazaar storefront and displays a bright "Out of Stock" badge to prevent customer checkout errors.
-- **Restock Auto-Reactivation**:
-  - Automatically resets stock to active (`500`) and re-enables customer purchasing when items return to supplier inventory.
-- **Gemini AI & Heuristic Catalog Intake**:
-  - Identifies uncataloged supplier products, strips messy vendor prefixes (e.g. `JINDEAL -`), standardizes titles, assigns store categories, and marks up wholesale cost with a standard 40% margin (`Math.round(cost * 1.40)`).
-- **Two-Way Catalog Persistence**:
-  - Updates PostgreSQL database (`Product` table with `PUBLISHED` status enum).
-  - Updates `src/lib/data/products.json` so Next.js static site generation (SSG) compiles instantly.
-- **Full-Stack Web Dashboard**:
-  - Built with React 19, Tailwind CSS, and Lucide icons.
-  - Live KPI stats, searchable audit logs, category filters, and an interactive storefront preview.
+- **Multi-Variant Ingestion**: Extracts all colors and MOQ pack sizes (e.g., 20 discrete variants for sliding tin containers across Silver, Black, Rose Gold, White, Blue × 12PCS, 108PCS, 204PCS, 500PCS) with individual SKUs, prices, and availability.
+- **Strict Fragrance Oil & Wax Filter**: Prohibits automated intake of fragrance oils, scent oils, aroma oils, perfume oils, and candle waxes.
+- **Canonical 38-Category Taxonomy**: Auto-classifies new items into Ekora Bazaar's 38 official canonical categories (`Category` table with foreign key linkage).
+- **Concurrency Locking**: PostgreSQL partial unique index `crawlrun_one_running` guarantees two crawls can never overlap or conflict behind connection poolers.
+- **Two-Misses Discontinuation Rule**: Only marks a product discontinued if it is absent in two consecutive crawl runs (`consecutiveMisses >= 2`).
+- **Field Locking Support**: Honors `Product.lockedFields`. Fields locked by an admin (e.g. custom pricing or descriptions) are never modified by the sync engine.
 
 ---
 
-## How It Works
+## Circuit Breaker Guardrails
 
-```
-[ Supplier Website (e.g. jindeal.com/shop/) ]
-                     │  (50 pages crawled, 52 unique items/page)
-                     ▼
-             [ Cheerio Crawler ]
-                     │  (Extracts title, price, stock badge, model code)
-                     ▼
-          [ O(1) Indexed Matcher ]
-        ┌────────────┴────────────┐
-        ▼                         ▼
- [ Matched Item ]          [ Uncataloged Item ]
-  • Check stock badge       • Gemini AI Title Cleaner
-  • If OOS -> Disable UI    • Categorizer & Tagging
-  • If Restocked -> Enable  • +40% Profit Margin Markup
-        │                         │
-        └────────────┬────────────┘
-                     ▼
-     [ Two-Way Synchronization ]
-        ├──> PostgreSQL Database ("Product" table)
-        └──> src/lib/data/products.json (Next.js storefront)
-```
+Before any change can touch live data, the Diff Engine evaluates 4 critical circuit breakers:
+
+| Guardrail | Threshold | Purpose |
+| :--- | :---: | :--- |
+| **Mass Stock Flip Check** | $\le 5.0\%$ of matched | Detects supplier feed corruption or glitch where mass items suddenly go OOS. |
+| **Mass Price Shift Check** | $\le 2.0\%$ of matched ($>30\%$ shift) | Prevents wholesale supplier price surges/drops from overwriting retail prices. |
+| **Supplier Disappearance Check** | $\le 10.0\%$ missing | Detects broken scrapers, blocked IPs, or truncated supplier feeds. |
+| **Minimum Crawl Yield Check** | $\ge 10$ products | Rejects empty or 404 supplier responses. |
 
 ---
 
-## Prerequisites
+## Field Ownership Matrix
 
-- **Node.js**: v18.0.0 or later (v20+ recommended)
-- **npm** or **bun** / **yarn**
-- PostgreSQL database (optional; if not configured, sync persists directly to `products.json`)
-
----
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Prabhleen114/stock-verification.git
-   cd stock-verification
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install --legacy-peer-deps
-   ```
+| Field | Source of Truth / Owner | Sync Behavior |
+| :--- | :---: | :--- |
+| `supplierAvailable` | Supplier Feed | Automatically updated in `STOCK_ONLY` and `FULL` modes |
+| `stock` | Calculated / Supplier | Set to 0 if supplier is OOS; restored on restock |
+| `price` | Admin / Computed ($\text{cost} \times 1.4$) | Updated only in approved `FULL` mode; blocked in `STOCK_ONLY` |
+| `title`, `description`, `images` | Admin Storefront | Preserved; never overwritten after initial approval |
+| `categoryId` | Admin Storefront | Bound to canonical `Category` table; never overwritten |
 
 ---
 
-## Configuration
+## How to Work This Repo (CLI Guide)
 
-Create a `.env` file in the root of the project (or ensure the parent project's `.env` exists):
+All commands are executed from the `stock-verification/` directory or repository root.
 
-```env
-# PostgreSQL Connection (Prisma / Direct URL)
-DATABASE_URL="postgresql://user:password@localhost:5432/ekorabazaar"
-DIRECT_URL="postgresql://user:password@localhost:5432/ekorabazaar"
-
-# Optional: Google Gemini API Key for AI title normalization
-GEMINI_API_KEY="your-gemini-api-key"
-
-# Port for Web UI Dashboard
-PORT=3000
-```
-
----
-
-## How to Work This Repo
-
-### 1. Interactive CLI Mode (Prompts for Website Link)
-
-To run the crawler and catalog sync interactively:
+### 1. Dry Run / Diff Only
+Runs the crawler, unpacks variants into the `SupplierProduct` vault, executes the Diff Engine, and checks guardrails **without modifying live products**:
 
 ```bash
-npm start
-# or
-npm run sync
+cd stock-verification
+# Full 13-page dry run crawl
+npx tsx server.ts --url="https://matinimpex.com/collections/all" --pages=13 --mode=DRY_RUN
+
+# Diff only against an existing crawl run (skips re-scraping)
+npx tsx server.ts --diff-only=<RUN_ID> --mode=DRY_RUN
 ```
 
-The CLI will display an interactive prompt:
-
-```text
-===============================================================
-   EKORA BAZAAR - STOCK VERIFICATION & CATALOG INTAKE ENGINE   
-===============================================================
-? Enter website URL to crawl [Default: https://jindeal.com/shop/] (or type 'web' for Dashboard): 
-```
-
-- **Press Enter** to crawl the default supplier (`https://jindeal.com/shop/`).
-- **Or type/paste any custom website URL** (e.g. `https://jindeal.com/shop/` or another WooCommerce category).
-- **Or type `web`** to launch the Web UI Dashboard on `http://localhost:3000`.
-
-Next, it will prompt for the number of pages to crawl:
-
-```text
-? Enter maximum pages to crawl [Default: 50]: 
-```
-
-- **Press Enter** to crawl all 50 pages.
-- **Or type a number** (e.g. `1` for a quick 52-product test, or `10` for 500 products).
-
-The crawler will execute, print progress page by page, match products, sync stock, and output the final execution summary:
-
-```text
-===============================================================
-SYNC EXECUTION SUMMARY:
-  Target Website Crawled:          https://jindeal.com/shop/
-  Total Supplier Products Crawled: 2564
-  Store Products Matched:          1932
-  Newly Marked Out of Stock:       101
-  Restocked Items Re-enabled:      65
-  New Products Ingested (+40%):    632
-  Total Active Store Catalog Size: 2754
-  Currently Out of Stock on Site:  384
-===============================================================
-Sync complete! Changes written to products.json & PostgreSQL.
-```
-
----
-
-### 2. Non-Interactive CLI Flags
-
-You can bypass the interactive prompts by passing arguments directly:
+### 2. Safe Stock-Only Sync
+Applies stock availability changes to matched products without touching retail prices or descriptions:
 
 ```bash
-# Crawl 10 pages of the default supplier
-npm run sync -- --pages=10
-
-# Crawl a specific URL and custom page limit
-npm run sync -- --url=https://jindeal.com/shop/ --pages=5
-
-# Quick 1-page test
-npx tsx server.ts --url=https://jindeal.com/shop/ --pages=1
+cd stock-verification
+npx tsx server.ts --diff-only=<RUN_ID> --mode=STOCK_ONLY --apply
 ```
 
----
-
-### 3. Web Management Dashboard (UI)
-
-To start the interactive web application:
+### 3. 1-Click Instant Rollback
+Reverts all database changes made during a specific run by replaying its `SyncAuditLog` backwards:
 
 ```bash
+cd stock-verification
+npx tsx server.ts --revert=<RUN_ID>
+```
+
+### 4. Web Management Dashboard
+Launches the interactive visual management UI:
+
+```bash
+cd stock-verification
 npm run dev
-# or
-npm run web
+# Dashboard opens on http://localhost:3000
 ```
 
-1. Open your browser and navigate to: `http://localhost:3000`
-2. **Dashboard Features**:
-   - **Crawler Hub**: Trigger live or sample crawl with custom URLs and page limits.
-   - **Audit Logs**: Filter by *Out of Stock*, *Restocked*, or *New Products Added*.
-   - **AI Normalizer Playground**: Test raw supplier titles and see Gemini AI title cleaning, categorization, and the 40% margin calculation in real time.
-   - **Interactive Storefront Preview**: View products and test that "Out of Stock" items display the red badge with disabled "Add to Cart" and "Buy Now" buttons.
-
 ---
 
-### 4. Automated Background Tasks (Windows)
-
-For automated scheduling (e.g. via Windows Task Scheduler):
-
-- **`run_sync.bat`**: Executes a full sync with default parameters and writes output to `sync.log`.
-- **`run_sync_hidden.vbs`**: Executes `run_sync.bat` silently in the background with no pop-up windows.
-
-To set up automatic daily sync:
-1. Open Windows Task Scheduler.
-2. Create a basic task triggered daily.
-3. Set the action to run `wscript.exe "C:\path\to\stock-verification\run_sync_hidden.vbs"`.
-
----
-
-## Architecture & File Structure
+## Directory Structure
 
 ```text
 stock-verification/
 ├── server/
-│   ├── crawler.ts         # Cheerio HTML scraper, pagination, and Flatsome deduplication
-│   ├── matcher.ts         # O(1) hash indexed matcher, model code extractor, and fuzzy scoring
-│   ├── store.ts           # PostgreSQL & products.json persistence, 40% margin calculator
-│   ├── aiCategorizer.ts   # Google Gemini AI title cleaner & categorizer
-│   ├── verifyReport.ts    # Repository verification & test audit metrics
-│   └── types.ts           # Data interfaces for products, logs, and summaries
-├── src/                   # React 19 + Tailwind CSS Frontend UI
-│   ├── components/        # CrawlerHub, Storefront, InventoryManager, AI Playground
-│   ├── App.tsx            # Main dashboard shell
-│   └── main.tsx           # React entry point
-├── server.ts              # Express API server, Vite dev server, and interactive CLI runner
-├── run_sync.bat           # Windows automation script
-├── run_sync_hidden.vbs    # Silent background launcher
-├── package.json           # Dependencies and CLI scripts
-├── tsconfig.json          # TypeScript compiler configuration
-└── vite.config.ts         # Vite bundler configuration
+│   ├── applyEngine.ts       # CAS transactional apply engine & rollback engine
+│   ├── classifier.ts        # Canonical 38-category classifier & forbidden oil/wax filter
+│   ├── crawlerVault.ts      # High-speed checkpointed vault crawler (Shopify/WooCommerce)
+│   ├── db.ts                # Database client resolver (unwraps TS/ESM proxy wrappers)
+│   ├── diffEngine.ts        # In-memory diff engine & circuit breaker guardrails
+│   ├── matcher.ts           # O(1) hash indexed matcher & model code extractor
+│   ├── store.ts             # In-memory store cache & test toggle helpers
+│   ├── aiCategorizer.ts     # Gemini AI categorization playground
+│   └── types.ts             # Core domain TypeScript interfaces
+├── src/                     # React 19 + Tailwind CSS Frontend UI
+│   ├── components/          # CrawlerHub, Storefront, InventoryManager, AI Playground
+│   ├── App.tsx              # Main dashboard shell
+│   └── main.tsx             # React entry point
+├── server.ts                # Express API server, Vite server, and CLI runner
+├── package.json             # Dependencies and scripts
+├── tsconfig.json            # TypeScript configuration
+└── vite.config.ts           # Vite bundler configuration
 ```
 
 ---
 
-## API Endpoints
+## Database Schema (Vault Tables)
 
-When running in web mode (`npm run dev`), the server exposes the following REST APIs:
+The pipeline introduces 5 core models in `prisma/schema.prisma`:
 
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/products` | Retrieve catalog products with optional `?category=` and `?inStockOnly=true` filters |
-| `POST` | `/api/sync/crawl` | Trigger crawl & sync (`{ mode: "live", url: "https://...", maxPages: 50 }`) |
-| `GET` | `/api/sync/summary` | Get latest sync execution metrics and audit logs |
-| `POST` | `/api/products/:id/toggle-stock` | Toggle in-stock status for instant storefront testing |
-| `POST` | `/api/ai/test-normalize` | Test Gemini AI title normalization and 40% profit markup on any raw title |
-| `GET` | `/api/verify-report` | Retrieve repository health and feature verification metrics |
-| `POST` | `/api/catalog/reset` | Reset catalog back to baseline |
+* **`SupplierProduct`**: Immutable mirror of supplier items keyed by `(supplierKey, externalProductId, externalVariantId)`.
+* **`CrawlRun`**: Execution ledger tracking status (`RUNNING`, `CRAWLED`, `HALTED_GUARDRAIL`, `APPLIED`, `ROLLED_BACK`), heartbeat, and circuit breaker reports.
+* **`StagingChange`**: Deduplicated proposed changes (`STOCK_CHANGED`, `PRICE_CHANGED`, `NEW`, `DISCONTINUED`, `REAPPEARED`) awaiting audit.
+* **`SyncAuditLog`**: Append-only log of every applied field change, containing `oldValue`, `newValue`, `actor`, and `revertedAt`.
+* **`Category`**: 38 canonical store categories with slugs and foreign key linkage to `Product.categoryId`.
 
 ---
 
-## Matching Algorithm & Performance
+## Safety Rules & Constraints
 
-Matching 2,564 scraped supplier items against 2,700+ store products using naive string distance requires $>6,900,000$ iterations, which can take over 15–20 minutes.
-
-This engine optimizes the process down to **seconds**:
-1. **Model Code Extraction**: Extracts alphanumeric identifiers (e.g., `JKB-3669` $\rightarrow$ `JKB3669`).
-2. **$O(1)$ Hash Map Lookup**: Pre-indexes store products by normalized model codes and stripped titles. If a model code matches, resolution happens in $<0.001\text{ ms}$.
-3. **Token Set Pre-Filter**: For non-model matches, checks word token overlap. If overlap is below $0.6$, expensive Levenshtein distance calculations are skipped entirely.
-4. **40% Margin Calculation**: For all newly ingested products:
-   $$\text{Retail Price} = \operatorname{round}(\text{Wholesale Cost} \times 1.40)$$
-   $$\text{Gross Profit} = \text{Retail Price} - \text{Wholesale Cost}$$
+1. **Customer Intelligence Isolation**: The stock verification engine operates independently of recommendation and checkout intelligence modules.
+2. **No Fragrance Oils or Waxes**: Any supplier product containing fragrance, aroma, perfume, scent, or wax keywords is permanently excluded from catalog intake.
+3. **No Overwrites of Manual Edits**: If a live product's field is listed in `Product.lockedFields`, the apply engine skips it and preserves admin customizations.

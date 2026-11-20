@@ -6,6 +6,7 @@ import pg from 'pg';
 const { Pool } = pg;
 
 import { StoreProduct, ScrapedSupplierProduct, SyncAuditItem, SyncSummary } from './types.ts';
+import { exportCatalogJson } from '../../scripts/export-catalog-json.ts';
 import {
   findBestStoreMatch,
   findFastStoreMatch,
@@ -171,6 +172,31 @@ const initialCatalog: StoreProduct[] = [
   },
 ];
 
+// Helper to detect fragrance oils or waxes to exclude from new catalog intake
+export function isFragranceOilOrWax(title: string): boolean {
+  if (!title) return false;
+  const t = title.toLowerCase();
+
+  // If it's craft equipment, mold, cutter, jar, bottle, melter, dye, wick, tool -> NOT wax/fragrance oil
+  const isEquipmentOrMold = /\b(mold|mould|melter|burner|heater|pot|jug|bottle|jar|dye|wick|eyelet|bead|cutter|tool|packaging|box|container|can)\b/i.test(t);
+
+  // Fragrance check
+  const isFragrance = /\b(fragrance|fragrance oil|essential oil|aroma oil|perfume oil|water based fragrance|scented oil|scent oil)\b/i.test(t) || /\b(FO\d{3}|FW\d{3}|EO\d{3})\b/i.test(t);
+
+  // Wax check
+  const isWax = /\b(soy wax|beeswax|bees wax|paraffin wax|paraffin|gel wax|palm wax|coconut wax|pillar wax|pearl wax|carnauba wax|candelilla wax|emulsifying wax|wax chunks|wax flakes|wax pellets|wax slab|wax block|wax melts?)\b/i.test(t) || (/\bwax\b/i.test(t) && !isEquipmentOrMold) || /\b(WX\d{3}|CX\d{3})\b/i.test(t);
+
+  if (isEquipmentOrMold && !isFragrance) {
+    return false;
+  }
+
+  if (isFragrance && !/\bempty\b/i.test(t)) {
+    return true;
+  }
+
+  return isWax;
+}
+
 class StoreManager {
   private products: StoreProduct[] = [];
   private rawEkoraProducts: any[] = [];
@@ -242,23 +268,24 @@ class StoreManager {
     console.log(`[StoreManager] Using fallback initial catalog with ${this.products.length} products.`);
   }
 
-  // Persist updated rawEkoraProducts to products.json
-  private saveRawCatalog(): void {
-    if (!PRODUCTS_JSON_PATH) return;
+  // Persist updated catalog to products.json via safe atomic exporter from PostgreSQL
+  private async saveRawCatalog(): Promise<void> {
     try {
-      fs.writeFileSync(PRODUCTS_JSON_PATH, JSON.stringify(this.rawEkoraProducts, null, 2), 'utf-8');
-      console.log(`[StoreManager] Successfully persisted changes to ${PRODUCTS_JSON_PATH}`);
+      await exportCatalogJson();
+      console.log(`[StoreManager] Successfully exported catalog from PostgreSQL to products.json`);
     } catch (err: any) {
-      console.error(`[StoreManager] Failed to write to ${PRODUCTS_JSON_PATH}:`, err.message);
+      console.error(`[StoreManager] Failed to export products.json:`, err.message);
     }
   }
 
   // Update PostgreSQL database stock state if connected
   private async updateDbStock(productId: string, inStock: boolean): Promise<void> {
     if (!dbPool) return;
-    const stockVal = inStock ? 500 : 0;
     try {
-      await dbPool.query('UPDATE "Product" SET stock = $1 WHERE id = $2', [stockVal, productId]);
+      await dbPool.query(
+        'UPDATE "Product" SET "supplierAvailable" = $1, stock = CASE WHEN $1 = false THEN 0 ELSE GREATEST(stock, 25) END WHERE id = $2',
+        [inStock, productId]
+      );
     } catch (err: any) {
       // Non-blocking warning
       console.warn(`[StoreManager DB] Stock update warning for ID ${productId}:`, err.message);
@@ -333,7 +360,7 @@ class StoreManager {
     if (raw) {
       raw.inStock = product.inStock;
       raw.isQuoteOnly = !product.inStock;
-      this.saveRawCatalog();
+      await this.saveRawCatalog();
     }
     await this.updateDbStock(id, product.inStock);
 
@@ -484,6 +511,26 @@ class StoreManager {
         }
       } else {
         // Case B: Product is NOT on website!
+        // User Instruction: "dont add any new fragrance oil or wax"
+        if (isFragranceOilOrWax(scraped.rawTitle)) {
+          newAuditItems.push({
+            id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+            timestamp: now,
+            supplierId: scraped.supplierId,
+            rawTitle: scraped.rawTitle,
+            normalizedTitle: scraped.cleanTitle,
+            modelCode: scraped.modelCode,
+            rawPrice: scraped.rawPrice,
+            calculatedPrice: Math.round(scraped.rawPrice * 1.4),
+            supplierStockStatus: scraped.isOutOfStock ? 'out_of_stock' : 'in_stock',
+            action: 'already_synced',
+            matchType: 'none',
+            confidenceScore: 0,
+            details: 'Skipped new catalog intake: Fragrance oil / wax product excluded per user instructions.',
+          });
+          continue;
+        }
+
         // Requirements: "if there is a product that is not on my website it should add that product to my stock,
         // use ai to categorise it and normalise its name removing keywords like 'jindeal', 'vedini' or any model number like jkb and add 40% profit margin to the original retail price."
 
@@ -600,7 +647,7 @@ class StoreManager {
 
     // Persist changes to products.json if modified
     if (catalogDirty) {
-      this.saveRawCatalog();
+      await this.saveRawCatalog();
     }
 
     // Prepend to audit log history (keep latest 200)
