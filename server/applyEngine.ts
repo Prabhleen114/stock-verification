@@ -251,7 +251,6 @@ export async function applyCrawlRun(
               const createdProduct = await tx.product.create({
                 data: {
                   title: afterData.title,
-                  slug: `${afterData.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}-${Date.now().toString(36)}`,
                   category: afterData.categoryName || 'General Silicone Moulds',
                   categoryId,
                   price: priceRupees,
