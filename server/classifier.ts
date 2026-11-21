@@ -81,20 +81,33 @@ export function isFragranceOilOrWax(item: {
     .join(' ')
     .toLowerCase();
 
-  // Patterns indicating fragrance oils, aroma oils, scent oils, perfume oils
+  // Extract model code prefix
+  const modelCode = extractModelCode(item.title || '');
+  let prefix = '';
+  if (modelCode) {
+    const pMatch = modelCode.match(/^([A-Za-z]+)/);
+    if (pMatch) prefix = pMatch[1].toUpperCase();
+  }
+
+  // 1. Direct SKU prefix checks
+  if (prefix === 'FO' && !combinedText.includes('foil')) {
+    return true;
+  }
+  if (prefix === 'CX' && (combinedText.includes('wax') || combinedText.includes('flakes'))) {
+    return true;
+  }
+
+  // 2. Patterns indicating fragrance oils, aroma oils, scent oils, perfume oils
   const fragrancePatterns = [
-    /\bfragrance\s*oil\b/,
-    /\bfragrance\b/,
-    /\bperfume\s*oil\b/,
-    /\baroma\s*oil\b/,
-    /\bscent\s*oil\b/,
-    /\bflavor\s*oil\b/,
-    /\bflavour\s*oil\b/,
-    /\bessential\s*oil\b/,
-    /\battar\s*oil\b/,
+    /\bfragrances?\s*oils?\b/,
+    /\bfragrances?\b/,
+    /\bperfumes?\s*oils?\b/,
+    /\baromas?\s*oils?\b/,
+    /\bscents?\s*oils?\b/,
+    /\battars?\s*oils?\b/,
   ];
 
-  // Patterns indicating wax or wax additives
+  // 3. Patterns indicating raw wax or wax additives
   const waxPatterns = [
     /\bsoya?\s*wax\b/,
     /\bsoy\s*wax\b/,
@@ -114,19 +127,81 @@ export function isFragranceOilOrWax(item: {
   ];
 
   for (const p of fragrancePatterns) {
-    if (p.test(combinedText)) return true;
+    if (p.test(combinedText) && !combinedText.includes('skin safe') && !combinedText.includes('mould') && !combinedText.includes('mold') && !combinedText.includes('foil')) {
+      return true;
+    }
   }
 
   for (const p of waxPatterns) {
-    if (p.test(combinedText)) return true;
+    if (p.test(combinedText) && !combinedText.includes('mould') && !combinedText.includes('mold') && !combinedText.includes('tin') && !combinedText.includes('melter') && !combinedText.includes('heater')) {
+      return true;
+    }
   }
 
-  // Standalone word check for 'wax' (making sure not to false-positive on 'wick' or 'mould')
-  if (/\bwax\b/.test(combinedText) && !combinedText.includes('mould') && !combinedText.includes('mold') && !combinedText.includes('tin')) {
+  // Standalone word check for 'wax' (making sure not to false-positive on 'mould', 'mold', 'tin', 'melter', 'heater')
+  if (
+    /\bwax\b/.test(combinedText) &&
+    !combinedText.includes('mould') &&
+    !combinedText.includes('mold') &&
+    !combinedText.includes('tin') &&
+    !combinedText.includes('melter') &&
+    !combinedText.includes('heater')
+  ) {
     return true;
   }
 
   return false;
+}
+
+/**
+ * Detects whether a product title represents a multi-pack or bundle listing
+ * where volume tier wholesale discounts must be disabled (noBulkTiers: true).
+ */
+export function detectMultiPack(title: string): { noBulkTiers: boolean; reason?: string } {
+  const t = title.trim();
+
+  // Explicit single piece exclusions (e.g. "- 1", "- 1 Pcs", "Single PCS", "1 Pcs", "1 Pc")
+  if (
+    /(?:-\s*1\s*(?:pcs?|piece)?$)/i.test(t) ||
+    /(?:\|\s*1\s*(?:pcs?|piece)$)/i.test(t) ||
+    /\bsingle\s*pcs?\b/i.test(t) ||
+    /\b1\s*(?:pcs?|piece)\s*$/i.test(t)
+  ) {
+    if (!/\bpack\s*of\s*[2-9]\d*\b/i.test(t) && !/\bset\s*of\s*[2-9]\d*\b/i.test(t)) {
+      return { noBulkTiers: false };
+    }
+  }
+
+  // Trailing quantity bundle (- 5, - 10, - 25, - 50, - 100, - 500, etc.)
+  const trailingDashMatch = t.match(/-\s*([2-9]|\d{2,5})\s*(?:pcs?|pieces?|strip|strips)?\s*$/i);
+  if (trailingDashMatch) {
+    return { noBulkTiers: true, reason: `Trailing quantity bundle (- ${trailingDashMatch[1]})` };
+  }
+
+  // Pack of X (X > 1)
+  const packOfMatch = t.match(/\bpack\s*(?:of)?\s*([2-9]|\d{2,5})\s*(?:pcs?|pieces?)?\b/i);
+  if (packOfMatch) {
+    return { noBulkTiers: true, reason: `Pack of ${packOfMatch[1]}` };
+  }
+
+  // Set of X (X > 1)
+  const setOfMatch = t.match(/\bset\s*of\s*([2-9]|\d{2,5})\s*(?:pcs?|pieces?|pc)?\b/i);
+  if (setOfMatch) {
+    return { noBulkTiers: true, reason: `Set of ${setOfMatch[1]}` };
+  }
+
+  // X pcs / pieces (X > 1)
+  const pcsMatch = t.match(/\b([2-9]|\d{2,5})\s*(?:pcs|pieces|pc)\b/i);
+  if (pcsMatch) {
+    return { noBulkTiers: true, reason: `${pcsMatch[1]} pcs / pieces` };
+  }
+
+  // Combo
+  if (/\bcombo\b/i.test(t)) {
+    return { noBulkTiers: true, reason: 'Combo bundle' };
+  }
+
+  return { noBulkTiers: false };
 }
 
 export interface ClassificationResult {
@@ -136,6 +211,10 @@ export interface ClassificationResult {
   confidence: 'HIGH' | 'LOW' | 'UNCLASSIFIED';
   status: 'CLASSIFIED' | 'NEEDS_REVIEW';
   reason: string;
+  isSafetyRejection?: boolean;
+  rejectionReason?: string;
+  noBulkTiers?: boolean;
+  multiPackReason?: string;
 }
 
 /**
@@ -148,256 +227,316 @@ export async function classifyProduct(item: {
   productType?: string | null;
 }): Promise<ClassificationResult> {
   const catMap = await getCategoryMap();
-  const text = [item.title || '', item.handle || '', item.productType || '', ...(item.tags || [])]
+  const title = item.title || '';
+  const titleLower = title.toLowerCase();
+  const textAll = [title, item.handle || '', item.productType || '', ...(item.tags || [])]
     .join(' ')
     .toLowerCase();
 
-  const titleLower = (item.title || '').toLowerCase();
+  const multiPack = detectMultiPack(title);
+
+  // Extract model code prefix
+  const modelCode = extractModelCode(title);
+  let prefix = '';
+  if (modelCode) {
+    const pMatch = modelCode.match(/^([A-Za-z]+)/);
+    if (pMatch) prefix = pMatch[1].toUpperCase();
+  }
+  if (!prefix) {
+    const rawMatch = title.match(/\b([A-Za-z]{2,5})\s*(\d{2,5}[a-zA-Z]?)\b/);
+    if (rawMatch) prefix = rawMatch[1].toUpperCase();
+  }
 
   let targetCategory: CanonicalCategory = 'General Silicone Moulds';
-  let confidence: 'HIGH' | 'LOW' | 'UNCLASSIFIED' = 'LOW';
-  let status: 'CLASSIFIED' | 'NEEDS_REVIEW' = 'NEEDS_REVIEW';
-  let reason = 'Default fallback';
+  let confidence: 'HIGH' | 'LOW' | 'UNCLASSIFIED' = 'HIGH';
+  let status: 'CLASSIFIED' | 'NEEDS_REVIEW' = 'CLASSIFIED';
+  let reason = 'Matched classification rules';
+  let isSafetyRejection = false;
+  let rejectionReason: string | undefined = undefined;
 
-  // 1. Metal Containers & Tins (e.g. tin-sliding-containers-lbc001-to-lbc005, aluminum tins)
-  if (
-    titleLower.includes('tin') ||
-    titleLower.includes('metal container') ||
-    titleLower.includes('sliding container') ||
-    titleLower.includes('tin canister') ||
-    titleLower.includes('aluminum tin') ||
-    titleLower.includes('aluminium tin')
-  ) {
-    targetCategory = 'Metal Containers & Tins';
+  // 1. SAFETY CHECK: Fragrance oils & Waxes
+  if (isFragranceOilOrWax(item)) {
+    targetCategory = (textAll.includes('wax') || textAll.includes('flakes')) ? 'Candle Waxes & Additives' : 'Fragrance Oils';
     confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched metal tin container keywords';
+    status = 'NEEDS_REVIEW';
+    isSafetyRejection = true;
+    rejectionReason = 'Product Safety Violation: Fragrance Oil / Candle Wax prohibited from intake';
+    reason = 'Safety Violation';
   }
-  // 2. Candle Jars & Glass Containers
+  // 2. Food-Grade Flavor Oils
   else if (
-    titleLower.includes('candle jar') ||
-    titleLower.includes('glass jar') ||
-    titleLower.includes('amber jar') ||
-    titleLower.includes('frosted jar') ||
-    titleLower.includes('candle tumbler') ||
-    titleLower.includes('concrete jar')
+    prefix === 'LSF' ||
+    (/\b(flavour|flavor)s?\b/i.test(titleLower) && /\b(lip\s*balm|lipstick|edible|food\s*grade)\b/i.test(titleLower))
   ) {
-    targetCategory = 'Candle Jars & Containers';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched candle jar keywords';
+    targetCategory = 'Food-Grade Flavor Oils';
+    reason = 'Matched lip safe flavor oil keywords';
   }
-  // 3. Attar & Perfume Bottles
+  // 3. Artisan Soap Bases
   else if (
-    titleLower.includes('attar bottle') ||
-    titleLower.includes('perfume bottle') ||
-    titleLower.includes('roll on') ||
-    titleLower.includes('dropper bottle') ||
-    titleLower.includes('cologne bottle')
+    prefix === 'SPB' ||
+    prefix === 'SSB' ||
+    /\bsoap\s*base\b/i.test(titleLower) ||
+    (/\bmelt\s*(?:&|and)\s*pour\b/i.test(titleLower) && !titleLower.includes('mould') && !titleLower.includes('mold'))
   ) {
-    targetCategory = 'Attar & Perfume Bottles';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched perfume/attar bottle keywords';
+    targetCategory = 'Artisan Soap Bases';
+    reason = 'Matched soap base keywords';
   }
-  // 4. Diffuser Bottles & Accessories
+  // 4. Haircare & Wash Bases
   else if (
-    titleLower.includes('diffuser') ||
-    titleLower.includes('reed stick') ||
-    titleLower.includes('car diffuser') ||
-    titleLower.includes('diffuser bottle')
+    prefix === 'LB' ||
+    /\b(shampoo\s*base|wash\s*base|body\s*wash\s*base|face\s*wash\s*base)\b/i.test(titleLower)
   ) {
-    targetCategory = 'Diffuser Bottles & Accessories';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched diffuser keywords';
+    targetCategory = 'Haircare & Wash Bases';
+    reason = 'Matched wash/shampoo base keywords';
   }
-  // 5. Wick Systems & Hardware
+  // 5. Body & Facial Scrubs
   else if (
-    titleLower.includes('wick') ||
-    titleLower.includes('sustainer') ||
-    titleLower.includes('wick holder') ||
-    titleLower.includes('wick sticker') ||
-    titleLower.includes('wick trimmer')
+    /\bscrub\b/i.test(titleLower) && !titleLower.includes('mould') && !titleLower.includes('mold')
   ) {
-    targetCategory = 'Wick Systems & Hardware';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched candle wick hardware keywords';
+    targetCategory = 'Body & Facial Scrubs';
+    reason = 'Matched scrub keywords';
   }
-  // 6. Packaging Boxes & Mailers
+  // 6. Hydrosols & Floral Waters
   else if (
-    titleLower.includes('box') ||
-    titleLower.includes('mailer') ||
-    titleLower.includes('corrugated') ||
-    titleLower.includes('carton') ||
-    titleLower.includes('kraft box')
+    /\b(rose\s*water|hydrosol|floral\s*water)\b/i.test(titleLower)
   ) {
-    targetCategory = 'Packaging Boxes & Mailers';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched packaging box keywords';
+    targetCategory = 'Hydrosols & Floral Waters';
+    reason = 'Matched hydrosol/rose water keywords';
   }
-  // 7. Lids, Caps & Closures
+  // 7. Skincare & Body Bases
   else if (
-    titleLower.includes('lid') ||
-    titleLower.includes('cap') ||
-    titleLower.includes('closure') ||
-    titleLower.includes('cork stopper')
+    prefix === 'LGB' ||
+    /\b(aloe\s*vera\s*gel|alovera\s*gel|lip\s*gloss\s*base|cream\s*base|lotion\s*base|cleansing\s*milk|moisturizing\s*cream|glycerin)\b/i.test(titleLower)
   ) {
-    targetCategory = 'Lids, Caps & Closures';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched lid/closure keywords';
+    targetCategory = 'Skincare & Body Bases';
+    reason = 'Matched skincare base keywords';
   }
-  // 8. Soap Making Tools
+  // 8. Raw Butters & Carrier Oils
   else if (
-    titleLower.includes('soap cutter') ||
-    titleLower.includes('soap beveler') ||
-    titleLower.includes('soap stamp') ||
-    titleLower.includes('soap slicer')
+    prefix === 'BT' ||
+    prefix === 'CO' ||
+    /\b(carrier\s*oil|kokum\s*butter|shea\s*butter|cocoa\s*butter|mango\s*butter)\b/i.test(titleLower) ||
+    (/\b(jojoba|avocado|almond|argan|castor|hemp\s*seed|apricot\s*kernel|rosehip|olive|grapeseed)\s*oil\b/i.test(titleLower) && !titleLower.includes('fragrance'))
   ) {
-    targetCategory = 'Soap Making Tools';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched soap tool keywords';
+    targetCategory = 'Raw Butters & Carrier Oils';
+    reason = 'Matched carrier oil or raw butter keywords';
   }
-  // 9. Micas & Pigments
+  // 9. Essential Oils
   else if (
-    titleLower.includes('mica') ||
-    titleLower.includes('pigment') ||
-    titleLower.includes('colorant') ||
-    titleLower.includes('glitter')
+    prefix === 'EO' ||
+    /\bessential\s*oil\b/i.test(titleLower)
   ) {
-    targetCategory = 'Micas & Pigments';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched mica/pigment keywords';
+    targetCategory = 'Essential Oils';
+    reason = 'Matched essential oil keywords';
   }
-  // 10. Dried Botanicals & Additives
+  // 10. Cosmetic Preservatives & Chemicals
   else if (
-    titleLower.includes('botanical') ||
-    titleLower.includes('dried rose') ||
-    titleLower.includes('lavender bud') ||
-    titleLower.includes('flower petal') ||
-    titleLower.includes('jasmine bud')
+    prefix === 'CH' ||
+    prefix === 'ABP' ||
+    /\b(phenoxyethanol|salicylic\s*acid|hyaluronic\s*acid|cyclopentasiloxane|polysorbate|denatured\s*ethanol|perfume\s*solvent|fixative|glycol|dimethicone|vitamin\s*e\s*oil)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Cosmetic Preservatives & Chemicals';
+    reason = 'Matched cosmetic chemical/solvent keywords';
+  }
+  // 11. Dried Botanicals & Additives
+  else if (
+    prefix === 'PW' ||
+    prefix === 'DP' ||
+    prefix === 'ADF' ||
+    prefix === 'CL' ||
+    prefix === 'CRM' ||
+    /\b(dried\s*flower|dried\s*petal|rose\s*petal|lavender\s*bud|butterfly\s*pea|hibiscus\s*petal|jasmine\s*bud|botanical|kaolin\s*clay|bentonite\s*clay|calamine\s*clay|multani\s*mitti|amla\s*powder|neem\s*powder|reetha|shikakai|bhringraj|brahmi|mulethi|ashwagandha|ubtan|menthol\s*crystal)\b/i.test(titleLower)
   ) {
     targetCategory = 'Dried Botanicals & Additives';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched dried botanical keywords';
+    reason = 'Matched dried botanical/clay/powder keywords';
   }
-  // 11. Gift Bags & Pouches
+  // 12. Micas & Pigments
   else if (
-    titleLower.includes('pouch') ||
-    titleLower.includes('gift bag') ||
-    titleLower.includes('organza') ||
-    titleLower.includes('potli') ||
-    titleLower.includes('jute bag')
+    ['LC', 'CP', 'CC', 'ACP', 'ACF', 'ARC', 'OC', 'LSC', 'GDC', 'MD', 'CWD'].includes(prefix) ||
+    /\b(mica|pigment|powder\s*colou?rs?|candle\s*colou?rs?|soap\s*colou?rs?|liquid\s*colou?rs?|neon\s*colou?rs?|fluorescent\s*colou?rs?|radium\s*colou?r|tempera|acrylic\s*colou?rs?|resin\s*colou?rs?|glitter|wax\s*dye|concrete\s*colou?rs?|conceret\s*colou?rs?|gold\s*dust)\b/i.test(titleLower) ||
+    ((titleLower.includes('color') || titleLower.includes('colour')) && (titleLower.includes('acrylic') || titleLower.includes('pearl') || titleLower.includes('powder') || titleLower.includes('liquid') || titleLower.includes('shade kit') || titleLower.includes('conceret') || titleLower.includes('concrete')))
   ) {
-    targetCategory = 'Gift Bags & Pouches';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched gift bag/pouch keywords';
+    targetCategory = 'Micas & Pigments';
+    reason = 'Matched colorant/mica/pigment keywords';
   }
-  // 12. Stickers & Labels
+  // 13. Wick Systems & Hardware
   else if (
-    titleLower.includes('sticker') ||
-    titleLower.includes('label') ||
-    titleLower.includes('warning label') ||
-    titleLower.includes('candle safety')
+    /\b(wick|sustainer|wick\s*holder|wick\s*sticker|wick\s*trimmer|wooden\s*wick|cotton\s*wick)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Wick Systems & Hardware';
+    reason = 'Matched candle wick hardware keywords';
+  }
+  // 14. Stickers & Labels
+  else if (
+    /\b(warning\s*label|candle\s*safety|safety\s*sticker|label\s*sticker|sticker\s*sheet)\b/i.test(titleLower)
   ) {
     targetCategory = 'Stickers & Labels';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
     reason = 'Matched sticker/label keywords';
   }
-  // 13. Festive & Holiday Molds
+  // 15. Soap Making Tools
   else if (
-    titleLower.includes('christmas') ||
-    titleLower.includes('santa') ||
-    titleLower.includes('elk') ||
-    titleLower.includes('tree') ||
-    titleLower.includes('halloween') ||
-    titleLower.includes('diwali') ||
-    titleLower.includes('easter') ||
-    titleLower.includes('valentine') ||
-    titleLower.includes('snow') ||
-    titleLower.includes('pumpkin')
+    prefix === 'SC' ||
+    prefix === 'LO' ||
+    /\b(soap\s*cutter|soap\s*beveler|soap\s*stamp|soap\s*slicer|wooden\s*cutter|loofah)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Soap Making Tools';
+    reason = 'Matched soap tool keywords';
+  }
+  // 16. Studio Equipment
+  else if (
+    prefix === 'NT' ||
+    prefix === 'PD' ||
+    prefix === 'BBC' ||
+    prefix === 'ACM' ||
+    /bbco{1,2}\d+/i.test(titleLower) ||
+    (prefix === 'ART' && !titleLower.includes('mould') && !titleLower.includes('mold') && !titleLower.includes('dia') && !titleLower.includes('bowl')) ||
+    /\b(brush(?:es)?|stencil|spatula|thermometer|digital\s*scale|weight\s*scale|craft\s*knife|heat\s*gun|melter|stainless\s*steel\s*jug|aluminum\s*jug|long\s*spout\s*jug|dropper|pipette|extinguisher|snuffer|tongue\s*cleaner|comb|easel|mixing\s*stick|piping\s*bag|stroke\s*pen)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Studio Equipment';
+    reason = 'Matched studio equipment/tool keywords';
+  }
+  // 17. Metal Containers & Tins
+  else if (
+    (/\b(tin|tins|sliding\s*container|aluminum\s*tin|metal\s*container|canister)\b/i.test(titleLower) && !titleLower.includes('mould') && !titleLower.includes('mold'))
+  ) {
+    targetCategory = 'Metal Containers & Tins';
+    reason = 'Matched metal tin container keywords';
+  }
+  // 18. Attar & Perfume Bottles
+  else if (
+    /\b(attar\s*bottle|perfume\s*bottle|roll\s*on\s*bottle|cologne\s*bottle)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Attar & Perfume Bottles';
+    reason = 'Matched perfume/attar bottle keywords';
+  }
+  // 19. Candle Jars & Containers
+  else if (
+    prefix === 'WC' ||
+    prefix === 'WCT' ||
+    /\b(candle\s*jar|candle\s*tumbler|candle\s*holder|wooden\s*candle\s*bowl|urli|tea\s*glass|ceramic\s*candle\s*holder|t-light|tealight|ceramic.*bowl|wooden\s*bowl|metal\s*diya|ceramic.*dia)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Candle Jars & Containers';
+    reason = 'Matched candle vessel/jar/urli keywords';
+  }
+  // 20. Cosmetic Jars & Bottles
+  else if (
+    /\b(cream\s*jar|frosted\s*cream\s*jar|spray\s*mist|pet\s*bottle|hair\s*oil.*bottle|dropper\s*bottle|cosmetic\s*jar|cosmetic\s*bottle)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Cosmetic Jars & Bottles';
+    reason = 'Matched cosmetic container keywords';
+  }
+  // 21. Diffuser Bottles & Accessories
+  else if (
+    /\b(diffuser|reed\s*stick|car\s*diffuser|aroma\s*nest)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Diffuser Bottles & Accessories';
+    reason = 'Matched diffuser keywords';
+  }
+  // 22. Packaging Boxes & Mailers
+  else if (
+    prefix === 'BCB' ||
+    /\b(corrugated|carton|mailer|kraft\s*box|packaging\s*box|gift\s*box|multi\s*purpose\s*box|window\s*box)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Packaging Boxes & Mailers';
+    reason = 'Matched packaging box keywords';
+  }
+  // 23. Gift Bags & Pouches
+  else if (
+    prefix === 'BQN' ||
+    /\b(pouch|gift\s*bag|organza|potli|jute\s*bag|bouquet\s*wrapping|mesh\s*net\s*fabric)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Gift Bags & Pouches';
+    reason = 'Matched gift pouch/bag keywords';
+  }
+  // 24. Lids, Caps & Closures
+  else if (
+    /\b(lid|caps?|closure|cork\s*stopper)\b/i.test(titleLower) &&
+    !titleLower.includes('mould') && !titleLower.includes('mold')
+  ) {
+    targetCategory = 'Lids, Caps & Closures';
+    reason = 'Matched lid/closure keywords';
+  }
+  // 25. Packaging & Containers
+  else if (
+    prefix === 'PM' ||
+    /\b(empty\s*paint\s*pots|honeycomb\s*roll|zip\s*lock|butter\s*paper|soap\s*cover|packaging\s*paper|packaging\s*rope|jute\s*rope)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Packaging & Containers';
+    reason = 'Matched general packaging keywords';
+  }
+  // 26. Resin & Concrete Craft
+  else if (
+    prefix === 'SAC' ||
+    prefix === 'AFF' ||
+    prefix === 'ARA' ||
+    prefix === 'ARR' ||
+    prefix === 'AGG' ||
+    prefix === 'SMB' ||
+    prefix === 'AST' ||
+    /\b(conceret\s*sealer|concrete\s*sealer|gypsum\s*powder|metallic\s*foil|varak|warak|craft\s*tape|glass\s*granuals|pearls\s*white|moti\s*100gram|pop\s*socket|keychain|evil\s*eye\s*beads|agate\s*ast|agate\s*stone|quartz\s*ast|conch\s*shell|wooden\s*slice|shell\s*pack)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Resin & Concrete Craft';
+    reason = 'Matched resin/concrete craft raw materials';
+  }
+  // 27. Festive & Holiday Molds
+  else if (
+    /\b(diwali|ganesha?|ganpati|shree|lord\s*ganesh|laxmi|lakshmi|ram\s*mandir|modak|christmas|santa|xmas|elk|reindeer|snowflake|snowman|halloween|skull|pumpkin|ghost|witch|bat|easter|bunny|valentine|romantic|heart|cupid)\b/i.test(titleLower)
   ) {
     targetCategory = 'Festive & Holiday Molds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
     reason = 'Matched holiday/festive keywords';
   }
-  // 14. Candle & Pillar Moulds
+  // 28. Storage & Trays
   else if (
-    (titleLower.includes('candle') || titleLower.includes('pillar') || titleLower.includes('bubble')) &&
-    (titleLower.includes('mould') || titleLower.includes('mold'))
-  ) {
-    targetCategory = 'Candle & Pillar Moulds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched candle mould keywords';
-  }
-  // 15. Soap & Bar Moulds
-  else if (
-    titleLower.includes('soap') &&
-    (titleLower.includes('mould') || titleLower.includes('mold') || titleLower.includes('cavity') || titleLower.includes('bar'))
-  ) {
-    targetCategory = 'Soap & Bar Moulds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched soap mould keywords';
-  }
-  // 16. Culinary & Fondant Moulds / Cake & Chocolate Decorating
-  else if (
-    titleLower.includes('fondant') ||
-    titleLower.includes('chocolate') ||
-    titleLower.includes('candy') ||
-    titleLower.includes('cake') ||
-    titleLower.includes('baking') ||
-    titleLower.includes('cupcake')
-  ) {
-    targetCategory = 'Culinary & Fondant Moulds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched confectionery/culinary keywords';
-  }
-  // 17. Eco-Resin & Stone Moulds / Storage & Trays
-  else if (
-    titleLower.includes('tray') ||
-    titleLower.includes('plate') ||
-    titleLower.includes('coaster') ||
-    titleLower.includes('dish') ||
-    titleLower.includes('platter')
+    /\b(tray|plate|dish|coaster|trinket\s*box|storage\s*jar|jewelry\s*dish|platter|bowl\s*mold|ashtray|palette|organizer\s*mold|container\s*mold)\b/i.test(titleLower) ||
+    (/\bplain\s*round\s*\d+\b/i.test(titleLower) && prefix === 'ARM')
   ) {
     targetCategory = 'Storage & Trays';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched tray/dish/coaster storage keywords';
+    reason = 'Matched tray/coaster/storage vessel keywords';
   }
+  // 29. Eco-Resin & Stone Moulds
   else if (
-    titleLower.includes('resin') ||
-    titleLower.includes('jesmonite') ||
-    titleLower.includes('concrete') ||
-    titleLower.includes('cement')
+    prefix === 'ARM' ||
+    /\b(planter|flower\s*pot|pot\s*mold|vase|jesmonite|concrete|cement|plaster|stone\s*mold|clock\s*mold|c\s*lock|agate\s*mould|agate\s*mold|bookend|pendent\s*mold|sphere\s*mold|bracelet\s*mold)\b/i.test(titleLower)
   ) {
     targetCategory = 'Eco-Resin & Stone Moulds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Matched resin/concrete craft keywords';
+    reason = 'Matched resin casting mould keywords';
   }
-  // 18. General Silicone Moulds (generic mould)
-  else if (titleLower.includes('mould') || titleLower.includes('mold') || titleLower.includes('silicone')) {
-    targetCategory = 'General Silicone Moulds';
-    confidence = 'HIGH';
-    status = 'CLASSIFIED';
-    reason = 'Generic silicone mould keyword';
-  } else {
-    // Unsure: Needs human admin review
+  // 30. Culinary & Fondant Moulds
+  else if (
+    prefix === 'CFM' ||
+    prefix === 'CK' ||
+    /\b(fondant|chocolate|candy|gummy|cupcake|baking|waffle|donut|ice\s*cream|popcorn|biscuit|cookie|berry|strawberry|fruit|fondant\s*mold|cake\s*decorating)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Culinary & Fondant Moulds';
+    reason = 'Matched confectionery/culinary mould keywords';
+  }
+  // 31. Candle & Pillar Moulds
+  else if (
+    prefix === 'WCM' ||
+    /\b(candle|pillar|taper|rib|swirl|cylinder|bubble|torso|bust|sculpture|wax\s*sachet|wax\s*melt|wick|flame|succulent|peony\s*flower|cactus\s*mould)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Candle & Pillar Moulds';
+    reason = 'Matched candle mould keywords';
+  }
+  // 32. Soap & Bar Moulds
+  else if (
+    prefix === 'SSM' ||
+    /\b(soap|bar\s*mould|bar\s*mold|massage\s*bar|lotion\s*bar|\d+g\s*mould|\d+g\s*mold)\b/i.test(titleLower)
+  ) {
+    targetCategory = 'Soap & Bar Moulds';
+    reason = 'Matched soap mould keywords';
+  }
+  // 33. Generic Silicone Moulds fallback
+  else if (/\b(mould|mold|silicone|silicon)\b/i.test(titleLower)) {
     targetCategory = 'General Silicone Moulds';
     confidence = 'LOW';
+    status = 'NEEDS_REVIEW';
+    reason = 'Generic silicone mould keyword';
+  }
+  // 34. Ambiguous fallback
+  else {
+    targetCategory = 'General Silicone Moulds';
+    confidence = 'UNCLASSIFIED';
     status = 'NEEDS_REVIEW';
     reason = 'Ambiguous product text; routed to admin review';
   }
@@ -413,5 +552,9 @@ export async function classifyProduct(item: {
     confidence,
     status,
     reason,
+    isSafetyRejection,
+    rejectionReason,
+    noBulkTiers: multiPack.noBulkTiers,
+    multiPackReason: multiPack.reason,
   };
 }
