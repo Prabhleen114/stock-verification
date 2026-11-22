@@ -184,6 +184,14 @@ export async function applyCrawlRun(
                 }
               }
 
+              // Studio Photo Protection: Never overwrite curated studio photos or locked image fields
+              const isCuratedStudioPhoto = (url?: string | null) =>
+                url && (url.startsWith('/images/products/') || url.startsWith('/images/custom/') || url.startsWith('/images/'));
+
+              if (isCuratedStudioPhoto(liveProduct.imageUrl) || lockedFields.has('imageUrl')) {
+                delete updateData.imageUrl;
+              }
+
               // Perform CAS update
               await tx.product.update({
                 where: {
@@ -248,6 +256,26 @@ export async function applyCrawlRun(
               const categoryId = change.categoryId;
               const priceRupees = afterData.priceRupees || Math.round(change.suggestedPrice / 100);
 
+              const rp = afterData.rawPayload?.product || afterData.rawPayload || {};
+              const rv = afterData.rawPayload?.variant;
+              const sourceImage: string | null =
+                rv?.featured_image?.src ||
+                (Array.isArray(rp.images) ? (typeof rp.images[0] === 'string' ? rp.images[0] : rp.images[0]?.src) : null) ||
+                rp.image?.src ||
+                null;
+
+              // Strict safety rule: Only add products with genuine supplier source photos.
+              if (!sourceImage || sourceImage.includes('1578749556568') || sourceImage.includes('unsplash.com')) {
+                await tx.stagingChange.update({
+                  where: { id: change.id },
+                  data: {
+                    status: 'REJECTED',
+                    conflictNote: 'Product rejected: Missing genuine supplier source photo. Stock verification requires real source photos.',
+                  },
+                });
+                continue;
+              }
+
               const createdProduct = await tx.product.create({
                 data: {
                   title: afterData.title,
@@ -257,14 +285,11 @@ export async function applyCrawlRun(
                   stock: afterData.supplierAvailable ? 50 : 0,
                   supplierAvailable: afterData.supplierAvailable,
                   status: 'PUBLISHED',
-                  imageUrl:
-                    afterData.rawPayload?.variant?.featured_image?.src ||
-                    afterData.rawPayload?.product?.images?.[0]?.src ||
-                    'https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?auto=format&fit=crop&w=600&q=80',
+                  imageUrl: sourceImage,
                   description:
-                    afterData.rawPayload?.product?.body_html ||
+                    rp.body_html ||
                     `Premium quality ${afterData.title} sourced directly for makers and studios.`,
-                  wholesaleTiers: [
+                  wholesaleTiers: afterData.wholesaleTiers || [
                     { minQty: 1, maxQty: 9, price: priceRupees, discountPct: 0 },
                     { minQty: 10, maxQty: 49, price: Math.round(priceRupees * 0.95), discountPct: 5 },
                     { minQty: 50, maxQty: null, price: Math.round(priceRupees * 0.9), discountPct: 10 },
@@ -272,12 +297,13 @@ export async function applyCrawlRun(
                 },
               });
 
-              // Link SupplierProduct to newly created product
+              // Link all SupplierProduct variants of this product to newly created product
+              const variantIdsToLink: string[] = afterData.allVariantIds || [change.externalVariantId];
               await tx.supplierProduct.updateMany({
                 where: {
                   supplierKey: change.supplierKey,
                   externalProductId: change.externalProductId,
-                  externalVariantId: change.externalVariantId,
+                  externalVariantId: { in: variantIdsToLink },
                 },
                 data: {
                   productId: createdProduct.id,
@@ -286,7 +312,6 @@ export async function applyCrawlRun(
                     where: {
                       supplierKey: change.supplierKey,
                       externalProductId: change.externalProductId,
-                      externalVariantId: change.externalVariantId,
                     },
                     select: { contentHash: true },
                   }))?.contentHash,

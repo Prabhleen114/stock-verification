@@ -157,6 +157,7 @@ export async function runDiffEngine(runId: string): Promise<DiffReport> {
   const stagedChanges: any[] = [];
   const guardrailChecks: GuardrailCheck[] = [];
   const linkagesToPersist: Array<{ id: string; productId: string; matchMethod: string }> = [];
+  const unmatchedList: typeof supplierProducts = [];
 
   // Pre-load categories for canonical foreign keys
   await getCategoryMap();
@@ -284,68 +285,142 @@ export async function runDiffEngine(runId: string): Promise<DiffReport> {
         });
       }
     } else {
-      // Unmatched: Candidate for NEW product intake
-      unmatchedNewCount++;
+      // Collect unmatched supplier products to group variants under parent products
+      unmatchedList.push(sp);
+    }
+  }
 
-      // USER CONSTRAINT: "dont add any new fragrance oil or wax"
-      const isForbidden = isFragranceOilOrWax({
-        title: sp.title,
-        handle: sp.handle,
-        tags: sp.tags,
-        productType: sp.productType,
-      });
+  // 2b. Process unmatched products grouped by externalProductId
+  const unmatchedByParent = new Map<string, typeof supplierProducts>();
+  for (const sp of unmatchedList) {
+    const parentKey = `${sp.supplierKey}:${sp.externalProductId}`;
+    const group = unmatchedByParent.get(parentKey) || [];
+    group.push(sp);
+    unmatchedByParent.set(parentKey, group);
+  }
 
-      if (isForbidden) {
-        excludedFragranceWaxCount++;
-        // Excluded from catalog intake. Never stage forbidden fragrance oils or waxes.
-        continue;
+  for (const [parentKey, group] of unmatchedByParent.entries()) {
+    unmatchedNewCount += group.length;
+    const firstSp = group[0];
+
+    // USER CONSTRAINT: "dont add any new fragrance oil or wax"
+    const isForbidden = isFragranceOilOrWax({
+      title: firstSp.title,
+      handle: firstSp.handle,
+      tags: firstSp.tags,
+      productType: firstSp.productType,
+    });
+
+    if (isForbidden) {
+      excludedFragranceWaxCount += group.length;
+      continue;
+    }
+
+    // Classify into canonical 38 categories
+    const classification = await classifyProduct({
+      title: firstSp.title,
+      handle: firstSp.handle,
+      tags: firstSp.tags,
+      productType: firstSp.productType,
+    });
+
+    // Check if variations are pack sizes (e.g. 5, 10, Pack of 5, Set of 10)
+    const isPackSize = (str?: string | null): number | null => {
+      if (!str) return null;
+      const m = str.trim().match(/^(?:pack\s*(?:of)?\s*|set\s*(?:of)?\s*)?(\d+)(?:\s*(?:pcs|pieces|units|packs?|pack))?$/i);
+      if (m) {
+        const qty = parseInt(m[1], 10);
+        if (qty > 1 && qty <= 1000) return qty;
       }
+      return null;
+    };
 
-      // Classify into canonical 38 categories
-      const classification = await classifyProduct({
-        title: sp.title,
-        handle: sp.handle,
-        tags: sp.tags,
-        productType: sp.productType,
+    const hasPackVariants = group.length > 1 && group.some((item) => isPackSize(item.variantTitle));
+
+    let generatedWholesaleTiers: any[] = [];
+    let variants: any[] = [];
+
+    const baseCostPaise = Math.min(...group.map((item) => item.costPaise || 15000));
+    const basePriceRupees = Math.round((baseCostPaise / 100) * 1.4);
+
+    if (hasPackVariants) {
+      // Map pack size variations to wholesale tiers on the parent product
+      const sortedByQty = [...group].sort((a, b) => {
+        const qA = isPackSize(a.variantTitle) || 1;
+        const qB = isPackSize(b.variantTitle) || 1;
+        return qA - qB;
       });
 
-      const originalCost = sp.costPaise || 15000;
-      const suggestedPrice = Math.round(originalCost * 1.4);
-      const suggestedTitle = sp.variantTitle ? `${sp.title} - ${sp.variantTitle}` : sp.title;
-
-      newProductChangesCount++;
-      const dedupeKey = `${sp.supplierKey}:${sp.externalProductId}:${sp.externalVariantId}:NEW:${sp.contentHash}`;
-
-      stagedChanges.push({
-        runId,
-        dedupeKey,
-        changeType: 'NEW',
-        supplierKey: sp.supplierKey,
-        externalProductId: sp.externalProductId,
-        externalVariantId: sp.externalVariantId,
-        suggestedTitle,
-        categoryId: classification.categoryId,
-        classificationConfidence: classification.confidence,
-        classificationStatus: classification.status,
-        suggestedPrice,
-        originalCost,
-        targetProductId: null,
-        before: null,
-        after: {
-          title: suggestedTitle,
-          categoryName: classification.categoryName,
-          categorySlug: classification.categorySlug,
-          categoryId: classification.categoryId,
-          priceRupees: Math.round(suggestedPrice / 100),
-          costPaise: originalCost,
-          supplierAvailable: sp.available,
-          sku: sp.sku,
-          handle: sp.handle,
-          rawPayload: null,
-        },
-        status: 'PENDING',
+      generatedWholesaleTiers = sortedByQty.map((item) => {
+        const qty = isPackSize(item.variantTitle) || 1;
+        const packCost = item.costPaise || baseCostPaise * qty;
+        const unitSellingPrice = Math.round((packCost / 100 / qty) * 1.4);
+        const discountPct = qty >= 10 ? 15 : qty >= 5 ? 10 : 0;
+        return {
+          minQty: qty,
+          maxQty: qty * 2,
+          price: unitSellingPrice,
+          discountPct,
+        };
+      });
+    } else if (group.length > 1) {
+      // True multi-variant product (e.g. 36 colors/sizes) -> map to variants JSON
+      variants = group.map((item) => {
+        const cost = item.costPaise || baseCostPaise;
+        const vPrice = Math.round((cost / 100) * 1.4);
+        return {
+          id: `${item.externalProductId}-${item.externalVariantId}`,
+          title: item.variantTitle || 'Default',
+          sku: item.sku,
+          pricePaise: cost,
+          price: vPrice,
+          available: item.available,
+          imageUrl: (item as any).rawPayload?.variant?.featured_image?.src || (item as any).rawPayload?.product?.images?.[0]?.src || null,
+          tiers: [
+            { minQty: 1, maxQty: 9, price: vPrice, discountPct: 0 },
+            { minQty: 10, maxQty: 49, price: Math.round(vPrice * 0.95), discountPct: 5 },
+            { minQty: 50, maxQty: null, price: Math.round(vPrice * 0.9), discountPct: 10 },
+          ],
+        };
       });
     }
+
+    const cleanTitle = cleanBrandPrefix(firstSp.title);
+    newProductChangesCount++;
+    const dedupeKey = `${firstSp.supplierKey}:${firstSp.externalProductId}:NEW:${firstSp.contentHash}`;
+
+    stagedChanges.push({
+      runId,
+      dedupeKey,
+      changeType: 'NEW',
+      supplierKey: firstSp.supplierKey,
+      externalProductId: firstSp.externalProductId,
+      externalVariantId: firstSp.externalVariantId,
+      suggestedTitle: cleanTitle,
+      categoryId: classification.categoryId,
+      classificationConfidence: classification.confidence,
+      classificationStatus: classification.status,
+      suggestedPrice: Math.round(baseCostPaise * 1.4),
+      originalCost: baseCostPaise,
+      targetProductId: null,
+      before: null,
+      after: {
+        title: cleanTitle,
+        categoryName: classification.categoryName,
+        categorySlug: classification.categorySlug,
+        categoryId: classification.categoryId,
+        priceRupees: basePriceRupees,
+        costPaise: baseCostPaise,
+        supplierAvailable: group.some((item) => item.available),
+        sku: firstSp.sku,
+        handle: firstSp.handle,
+        variants,
+        wholesaleTiers: generatedWholesaleTiers.length > 0 ? generatedWholesaleTiers : undefined,
+        rawPayload: (firstSp as any).rawPayload,
+        allVariantIds: group.map((item) => item.externalVariantId),
+      },
+      status: 'PENDING',
+    });
   }
 
   // 3. Persist new linkages & staging changes to DB in bulk

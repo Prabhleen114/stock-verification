@@ -241,7 +241,7 @@ class StoreManager {
             modelCode,
             supplierUrl: p.image?.includes('jindeal.com') ? 'https://jindeal.com/shop/' : undefined,
             supplierTitle: p.name,
-            imageUrl: p.image || 'https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?auto=format&fit=crop&w=600&q=80',
+            imageUrl: p.image || null,
             description: p.description || '',
             features: [
               'Commercial food-grade silicone',
@@ -252,6 +252,8 @@ class StoreManager {
             lastSyncedAt: new Date().toISOString(),
             source: 'catalog_default',
             outOfStockSince: isOos ? new Date().toISOString() : null,
+            variants: p.variants || [],
+            wholesaleTiers: p.tiers || [],
           });
         }
 
@@ -511,7 +513,27 @@ class StoreManager {
         }
       } else {
         // Case B: Product is NOT on website!
-        // User Instruction: "dont add any new fragrance oil or wax"
+        // Safety constraint 1: Strictly reject products without genuine supplier photo or with Unsplash/placeholder
+        if (!scraped.imageUrl || scraped.imageUrl.includes('unsplash.com') || scraped.imageUrl.includes('1578749556568')) {
+          newAuditItems.push({
+            id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+            timestamp: now,
+            supplierId: scraped.supplierId,
+            rawTitle: scraped.rawTitle,
+            normalizedTitle: scraped.cleanTitle,
+            modelCode: scraped.modelCode,
+            rawPrice: scraped.rawPrice,
+            calculatedPrice: Math.round(scraped.rawPrice * 1.4),
+            supplierStockStatus: scraped.isOutOfStock ? 'out_of_stock' : 'in_stock',
+            action: 'already_synced',
+            matchType: 'none',
+            confidenceScore: 0,
+            details: 'Skipped new catalog intake: Missing genuine supplier photo (placeholder / Unsplash prohibited).',
+          });
+          continue;
+        }
+
+        // Safety constraint 2: "dont add any new fragrance oil or wax"
         if (isFragranceOilOrWax(scraped.rawTitle)) {
           newAuditItems.push({
             id: `audit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -569,6 +591,7 @@ class StoreManager {
           lastSyncedAt: now,
           source: 'jindeal_crawler',
           outOfStockSince: scraped.isOutOfStock ? now : null,
+          variants: scraped.variants || [],
         };
 
         // Add to in-memory catalog and index
@@ -616,6 +639,7 @@ class StoreManager {
           disciplines: ['candle-studio', 'resin-lab', 'soap-atelier'],
           isQuoteOnly: scraped.isOutOfStock,
           inStock: !scraped.isOutOfStock,
+          ...(scraped.variants && scraped.variants.length > 0 ? { variants: scraped.variants } : {}),
         };
 
         this.rawEkoraProducts.unshift(newRawEkora);

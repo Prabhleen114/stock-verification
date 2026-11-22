@@ -1,6 +1,46 @@
 import * as cheerio from 'cheerio';
-import { ScrapedSupplierProduct } from './types.ts';
+import { ScrapedSupplierProduct, ProductVariantItem } from './types.ts';
 import { cleanBrandPrefix, extractModelCode } from './matcher.ts';
+
+// Helper to fetch WooCommerce variations if a product has multiple options
+async function fetchWooCommerceVariations(productUrl: string): Promise<ProductVariantItem[]> {
+  if (!productUrl) return [];
+  try {
+    const res = await fetch(productUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    const form = $('form.variations_form');
+    const variationsAttr = form.attr('data-product_variations');
+    if (!variationsAttr) return [];
+    const variationsData = JSON.parse(variationsAttr);
+    if (!Array.isArray(variationsData)) return [];
+
+    return variationsData.map((v: any) => {
+      const attrVals = Object.values(v.attributes || {}).filter(Boolean).map(String);
+      const title = attrVals.join(' / ') || `Option ${v.variation_id}`;
+      const priceVal = v.display_price || v.display_regular_price || 0;
+      return {
+        id: String(v.variation_id),
+        title,
+        sku: v.sku ? String(v.sku).trim() : null,
+        pricePaise: Math.round(Number(priceVal) * 100),
+        available: v.is_in_stock !== false,
+        imageUrl: v.image?.url || v.image?.src || null,
+        options: v.attributes || {},
+      };
+    });
+  } catch {
+    return [];
+  }
+}
 
 // Helper to parse rupee or dollar price string like "₹129.00", "₹269.00 You save", "129"
 export function parsePrice(priceText: string): number {
@@ -97,72 +137,66 @@ async function crawlShopifySupplier(
         for (const p of data.products) {
           const variants = p.variants || [];
           const baseTitle = p.title.trim();
+          const cleanTitle = cleanBrandPrefix(baseTitle);
           const handle = p.handle;
-          const defaultImg =
-            p.images?.[0]?.src ||
-            'https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?auto=format&fit=crop&w=600&q=80';
+          const defaultImg = p.images?.[0]?.src || null;
+          const productId = String(p.id);
 
+          if (seenSupplierIds.has(productId)) continue;
+          seenSupplierIds.add(productId);
+
+          // Group all variants under this single product
+          let parsedVariants: ProductVariantItem[] = [];
           if (variants.length > 1) {
-            // Unpack every variant ("if an item has multiple variants dont forget to scrape them off")
-            for (const v of variants) {
-              const variantId = String(v.id);
-              if (seenSupplierIds.has(variantId)) continue;
-              seenSupplierIds.add(variantId);
-
-              const variantTitleSuffix =
-                v.title && v.title !== 'Default Title' ? ` - ${v.title.trim()}` : '';
-              const rawTitle = `${baseTitle}${variantTitleSuffix}`;
-              const cleanTitle = `${cleanBrandPrefix(baseTitle)}${variantTitleSuffix}`;
-              const modelCode = v.sku?.trim() || extractModelCode(rawTitle) || extractModelCode(baseTitle);
-              const rawPrice = parsePrice(String(v.price));
-              const isOutOfStock = v.available === false;
-              const productUrl = `${origin}/products/${handle}?variant=${v.id}`;
-              const imageUrl = v.featured_image?.src || defaultImg;
-
-              products.push({
-                supplierId: variantId,
-                rawTitle,
-                cleanTitle,
-                modelCode: modelCode || null,
-                rawPrice,
-                isOutOfStock,
-                productUrl,
-                imageUrl,
-                page,
-              });
-              pageExtracted++;
-            }
-          } else {
-            // Single variant or default title
-            const v = variants[0] || {};
-            const variantId = String(v.id || p.id);
-            if (seenSupplierIds.has(variantId)) continue;
-            seenSupplierIds.add(variantId);
-
-            const rawTitle = baseTitle;
-            const cleanTitle = cleanBrandPrefix(baseTitle);
-            const modelCode = v.sku?.trim() || extractModelCode(rawTitle);
-            const rawPrice = parsePrice(String(v.price));
-            const isOutOfStock = v.available === false;
-            const productUrl = `${origin}/products/${handle}`;
-            const imageUrl = v.featured_image?.src || defaultImg;
-
-            products.push({
-              supplierId: variantId,
-              rawTitle,
-              cleanTitle,
-              modelCode: modelCode || null,
-              rawPrice,
-              isOutOfStock,
-              productUrl,
-              imageUrl,
-              page,
+            parsedVariants = variants.map((v: any) => {
+              const vTitle = v.title && v.title !== 'Default Title' ? v.title.trim() : 'Default';
+              const vPrice = parsePrice(String(v.price));
+              return {
+                id: String(v.id),
+                title: vTitle,
+                sku: v.sku?.trim() || null,
+                pricePaise: Math.round(vPrice * 100),
+                available: v.available !== false,
+                imageUrl: v.featured_image?.src || defaultImg,
+                options: {
+                  option1: v.option1,
+                  option2: v.option2,
+                  option3: v.option3,
+                },
+              };
             });
-            pageExtracted++;
           }
+
+          const validPrices = parsedVariants.map((v) => v.pricePaise).filter((p) => p > 0);
+          const minPrice = validPrices.length > 0
+            ? Math.min(...validPrices) / 100
+            : parsePrice(String(variants[0]?.price || p.price || 0));
+
+          const allOos = parsedVariants.length > 0
+            ? parsedVariants.every((v) => !v.available)
+            : variants[0]?.available === false;
+
+          const modelCode = variants[0]?.sku?.trim() || extractModelCode(baseTitle) || null;
+          const productUrl = `${origin}/products/${handle}`;
+          const imageUrl = variants[0]?.featured_image?.src || defaultImg;
+
+          products.push({
+            supplierId: productId,
+            rawTitle: baseTitle,
+            cleanTitle,
+            modelCode,
+            rawPrice: minPrice,
+            isOutOfStock: allOos,
+            productUrl,
+            imageUrl,
+            variants: parsedVariants,
+            rawPayload: p,
+            page,
+          });
+          pageExtracted++;
         }
 
-        const progressMsg = `[Shopify Crawler] Page ${page}/${maxPages}: Scraped ${pageExtracted} variants (Total scraped: ${products.length})`;
+        const progressMsg = `[Shopify Crawler] Page ${page}/${maxPages}: Scraped ${pageExtracted} products (Total scraped: ${products.length})`;
         logs.push(progressMsg);
         console.log(progressMsg);
         pageSuccess = true;
@@ -262,6 +296,18 @@ export async function crawlLiveSupplier(
         }
 
         let pageExtracted = 0;
+        const pageItems: Array<{
+          supplierId: string;
+          rawTitle: string;
+          cleanTitle: string;
+          modelCode: string | null;
+          rawPrice: number;
+          isOutOfStock: boolean;
+          productUrl: string;
+          imageUrl: string | null;
+          isVariable: boolean;
+        }> = [];
+
         productElements.each((_, el) => {
           // If element is an inner Flatsome box wrapper, skip to avoid double counting
           if ($(el).hasClass('box') && $(el).parents('.product-small').length > 0) return;
@@ -287,6 +333,12 @@ export async function crawlLiveSupplier(
             $(el).find('.outofstock-badge').length > 0 ||
             $(el).text().toLowerCase().includes('out of stock');
 
+          // Variable product detection
+          const isVariable =
+            $(el).hasClass('product-type-variable') ||
+            $(el).find('.product_type_variable').length > 0 ||
+            $(el).find('a:contains("Select options")').length > 0;
+
           // Price extraction
           const priceEl = $(el).find('.price');
           const currentPriceText =
@@ -301,12 +353,12 @@ export async function crawlLiveSupplier(
             imgEl.attr('data-src') ||
             imgEl.attr('data-lazy-src') ||
             imgEl.attr('src') ||
-            'https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?auto=format&fit=crop&w=600&q=80';
+            null;
 
           const modelCode = extractModelCode(rawTitle);
           const cleanTitle = cleanBrandPrefix(rawTitle);
 
-          products.push({
+          pageItems.push({
             supplierId,
             rawTitle,
             cleanTitle,
@@ -315,10 +367,42 @@ export async function crawlLiveSupplier(
             isOutOfStock,
             productUrl,
             imageUrl,
+            isVariable,
+          });
+        });
+
+        // Process extracted items and fetch variations for variable items
+        for (const item of pageItems) {
+          let itemVariants: ProductVariantItem[] = [];
+          let finalPrice = item.rawPrice;
+          let finalOos = item.isOutOfStock;
+
+          if (item.isVariable && item.productUrl) {
+            const variations = await fetchWooCommerceVariations(item.productUrl);
+            if (variations.length > 0) {
+              itemVariants = variations;
+              const validPrices = variations.map((v) => v.pricePaise).filter((p) => p > 0);
+              if (validPrices.length > 0) {
+                finalPrice = Math.min(...validPrices) / 100;
+              }
+              finalOos = variations.every((v) => !v.available);
+            }
+          }
+
+          products.push({
+            supplierId: item.supplierId,
+            rawTitle: item.rawTitle,
+            cleanTitle: item.cleanTitle,
+            modelCode: item.modelCode,
+            rawPrice: finalPrice,
+            isOutOfStock: finalOos,
+            productUrl: item.productUrl,
+            imageUrl: item.imageUrl,
+            variants: itemVariants,
             page,
           });
           pageExtracted++;
-        });
+        }
 
         const progressMsg = `[Crawler] Page ${page}/${maxPages}: Extracted ${pageExtracted} products (Total crawled: ${products.length})`;
         logs.push(progressMsg);

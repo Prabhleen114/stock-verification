@@ -1,3 +1,18 @@
+export interface ProductVariantItem {
+  id: string;
+  title: string;
+  sku?: string | null;
+  pricePaise: number;
+  available: boolean;
+  imageUrl?: string | null;
+  options?: Record<string, string>;
+  size?: string;
+  color?: string;
+  hex?: string;
+  price?: number;
+  tiers?: Array<{ minQty: number; maxQty: number | null; price: number; discountPct: number }>;
+}
+
 export interface StoreProduct {
   id: string;
   title: string;
@@ -12,13 +27,15 @@ export interface StoreProduct {
   modelCode: string | null;
   supplierUrl?: string;
   supplierTitle?: string;
-  imageUrl: string;
+  imageUrl: string | null;
   description: string;
   features?: string[];
   tags: string[];
   lastSyncedAt: string;
   source: 'catalog_default' | 'jindeal_crawler' | 'manual';
   outOfStockSince?: string | null;
+  variants?: ProductVariantItem[];
+  wholesaleTiers?: Array<{ minQty: number; maxQty: number | null; price: number; discountPct: number }>;
 }
 
 export interface ScrapedSupplierProduct {
@@ -29,7 +46,9 @@ export interface ScrapedSupplierProduct {
   rawPrice: number;
   isOutOfStock: boolean;
   productUrl: string;
-  imageUrl: string;
+  imageUrl: string | null;
+  variants?: ProductVariantItem[];
+  rawPayload?: any;
   page?: number;
 }
 
